@@ -1,0 +1,58 @@
+[
+  {
+    "server": "swift",
+    "run": 1,
+    "client_mib_per_sec": 292.03,
+    "echo_per_sec": 1196172.25,
+    "p50": "16384",
+    "p99": "65536",
+    "p999": "65536",
+    "server_cpu_ms": 3015.6,
+    "server_cpu_percent": 180.4,
+    "server_peak_ws_mib": 2087.53,
+    "server_accepted": "10001",
+    "server_bytes": "512000000"
+  },
+  {
+    "server": "cpp",
+    "run": 1,
+    "client_mib_per_sec": 496.22,
+    "echo_per_sec": 2032520.33,
+    "p50": "16384",
+    "p99": "65536",
+    "p999": "65536",
+    "server_cpu_ms": 3234.4,
+    "server_cpu_percent": 328.7,
+    "server_peak_ws_mib": 2079.66,
+    "server_accepted": "10001",
+    "server_bytes": "512000000"
+  },
+  {
+    "server": "swift",
+    "run": 2,
+    "client_mib_per_sec": 306.32,
+    "echo_per_sec": 1254705.14,
+    "p50": "8192",
+    "p99": "65536",
+    "p999": "65536",
+    "server_cpu_ms": 2734.4,
+    "server_cpu_percent": 171.5,
+    "server_peak_ws_mib": 2087.44,
+    "server_accepted": "10001",
+    "server_bytes": "512000000"
+  },
+  {
+    "server": "cpp",
+    "run": 2,
+    "client_mib_per_sec": 303.28,
+    "echo_per_sec": 1242236.02,
+    "p50": "8192",
+    "p99": "65536",
+    "p999": "65536",
+    "server_cpu_ms": 2375.0,
+    "server_cpu_percent": 147.5,
+    "server_peak_ws_mib": 2078.12,
+    "server_accepted": "10001",
+    "server_bytes": "512000000"
+  }
+]

@@ -1,0 +1,42 @@
+[
+  {
+    "server": "swift",
+    "run": 1,
+    "storm_successes": 3000,
+    "storm_failures": 0,
+    "storm_ms": 97,
+    "storm_cps": 30928.0,
+    "server_accepted": 3002,
+    "stderr": ""
+  },
+  {
+    "server": "cpp",
+    "run": 1,
+    "storm_successes": 3000,
+    "storm_failures": 0,
+    "storm_ms": 89,
+    "storm_cps": 33708.0,
+    "server_accepted": 3002,
+    "stderr": ""
+  },
+  {
+    "server": "swift",
+    "run": 2,
+    "storm_successes": 3000,
+    "storm_failures": 0,
+    "storm_ms": 73,
+    "storm_cps": 41096.0,
+    "server_accepted": 3002,
+    "stderr": ""
+  },
+  {
+    "server": "cpp",
+    "run": 2,
+    "storm_successes": 3000,
+    "storm_failures": 0,
+    "storm_ms": 73,
+    "storm_cps": 41096.0,
+    "server_accepted": 3002,
+    "stderr": ""
+  }
+]
