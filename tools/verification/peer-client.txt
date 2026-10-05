@@ -1,0 +1,1 @@
+..\..\..\swift-echo-client\.build\out\Products\Release-windows-x86_64\swift-echo-client.exe
