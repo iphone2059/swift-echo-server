@@ -1,5 +1,53 @@
 // Argument contract and checked arithmetic. Every rule mirrors the C++ baseline:
 // strict switches, case-insensitive ASCII names, and no positional arguments.
+// MARK: - Binary contract (echo-binary-contract-v1)
+
+/// Diagnostic tokens that must follow "Invalid arguments: " on stderr.
+package enum CESArgumentToken {
+  package static let protocolOption = "protocol-option"
+  package static let invalidNumber = "invalid-number"
+  package static let outOfRange = "out-of-range"
+  package static let unknownSwitch = "unknown-switch"
+}
+
+/// Which protocol a switch belongs to; a switch used with the wrong one is a usage error.
+package enum CESSwitchScope { case both, tcpOnly, udpOnly }
+
+/// One value switch: its name, the range it accepts and the protocol it applies to.
+package struct CESSwitch {
+  package let name: String
+  package let minimum: UInt64
+  package let maximum: UInt64
+  package let scope: CESSwitchScope
+}
+
+/// The accepted value switches, as value data: one place for names, ranges and protocol scope.
+package enum CESSwitchTable {
+  package static let valueSwitches: [CESSwitch] = [
+    CESSwitch(name: "s", minimum: 1, maximum: 65_535, scope: .both),
+    CESSwitch(name: "t", minimum: 1, maximum: UInt64(UInt32.max), scope: .tcpOnly),
+    CESSwitch(name: "w", minimum: 1, maximum: UInt64(UInt32.max), scope: .both),
+    CESSwitch(name: "b", minimum: 0, maximum: UInt64(Int32.max), scope: .both),
+    CESSwitch(name: "k", minimum: 1, maximum: 65_536, scope: .udpOnly),
+    CESSwitch(name: "threads", minimum: 1, maximum: 64, scope: .both),
+    CESSwitch(name: "rio-buffer", minimum: 512, maximum: 1_048_576, scope: .both),
+    CESSwitch(name: "cq", minimum: 64, maximum: 1_048_576, scope: .both),
+    CESSwitch(name: "memory", minimum: 1_048_576, maximum: UInt64.max, scope: .both),
+  ]
+
+  package static func lookup(_ name: String) -> CESSwitch? {
+    valueSwitches.first { $0.name == name }
+  }
+}
+
+/// The usage text: stdout for a valid /h, stderr for a usage error.
+package let cesUsageText = """
+Usage: swift-echo-server /p tcp|udp [/s port] [/t seconds] [/w seconds]
+       [/b bytes] [/k udp-depth] [/threads workers] [/rio-buffer bytes]
+       [/cq capacity] [/memory bytes] [/q] [/stats]
+Data I/O is always RIO; CQ notification is always IOCP. No fallback backend exists.
+
+"""
 package func cesCheckedProduct(_ a: UInt64, _ b: UInt64) -> UInt64? {
   let (value, overflow) = a.multipliedReportingOverflow(by: b)
   return overflow ? nil : value
@@ -42,11 +90,11 @@ private func numeric(_ value: [UInt16]) throws(CESArgumentError) -> UInt64 {
   var result: UInt64 = 0
   for char in value {
     guard (48...57).contains(char), let product = cesCheckedProduct(result, 10) else {
-      throw CESArgumentError(message: "numeric switch has an invalid value")
+      throw CESArgumentError(message: CESArgumentToken.invalidNumber)
     }
     let (next, overflow) = product.addingReportingOverflow(UInt64(char - 48))
     guard !overflow else {
-      throw CESArgumentError(message: "numeric switch has an invalid value")
+      throw CESArgumentError(message: CESArgumentToken.invalidNumber)
     }
     result = next
   }
@@ -84,7 +132,7 @@ package func cesParseOptions(_ arguments: [[UInt16]]) throws(CESArgumentError) -
     }
     guard
       ["p", "s", "t", "w", "b", "k", "threads", "rio-buffer", "cq", "memory"].contains(name)
-    else { throw CESArgumentError(message: "unknown switch") }
+    else { throw CESArgumentError(message: CESArgumentToken.unknownSwitch) }
     let value: [UInt16]
     if let inline {
       value = inline
@@ -116,7 +164,7 @@ package func cesParseOptions(_ arguments: [[UInt16]]) throws(CESArgumentError) -
     default: range = 1_048_576...UInt64.max
     }
     guard range.contains(n) else {
-      throw CESArgumentError(message: "unknown switch or value outside its valid range")
+      throw CESArgumentError(message: CESArgumentToken.outOfRange)
     }
     switch name {
     case "s": o.port = UInt16(n)
@@ -136,15 +184,15 @@ package func cesParseOptions(_ arguments: [[UInt16]]) throws(CESArgumentError) -
     default: o.memoryBytes = n
     }
   }
+  if o.protocolKind == .tcp && sawUDPDepth {
+    throw CESArgumentError(message: CESArgumentToken.protocolOption)
+  }
+  if o.protocolKind == .udp && sawTimeout {
+    throw CESArgumentError(message: CESArgumentToken.protocolOption)
+  }
   if o.help { return o }
   guard o.protocolKind != .none else {
     throw CESArgumentError(message: "missing /p tcp or /p udp")
-  }
-  if o.protocolKind == .tcp && sawUDPDepth {
-    throw CESArgumentError(message: "/k is available only for UDP")
-  }
-  if o.protocolKind == .udp && sawTimeout {
-    throw CESArgumentError(message: "/t is available only for TCP")
   }
   if o.protocolKind == .udp {
     if !sawRIOBuffer {

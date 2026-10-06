@@ -3,15 +3,13 @@ import Foundation
 import WinSDK
 
 @main struct SwiftEchoServer {
-  static func help() {
-    print(
-      """
-      Usage: swift-echo-server /p tcp|udp [/s port] [/t seconds] [/w seconds]
-             [/b bytes] [/k udp-depth] [/threads workers] [/rio-buffer bytes]
-             [/cq capacity] [/memory bytes] [/q] [/stats]
-      Data I/O is always RIO; CQ notification is always IOCP. No fallback backend exists.
-      """)
+  static func writeUsage(_ handle: FileHandle) {
+    handle.write(Data(cesUsageText.utf8))
   }
+
+  static func help() { writeUsage(.standardOutput) }
+
+  static func usageError() { writeUsage(.standardError) }
   static func run() -> CESExitCode {
     let args: [[UInt16]]
     do { args = try cesWindowsArguments() } catch {
@@ -21,7 +19,7 @@ import WinSDK
     let options: CESOptions
     do { options = try cesParseOptions(args) } catch {
       FileHandle.standardError.write(Data("Invalid arguments: \(error.message)\n".utf8))
-      help()
+      usageError()
       return .usage
     }
     if options.help {
