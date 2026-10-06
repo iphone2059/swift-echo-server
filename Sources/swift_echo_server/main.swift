@@ -2,7 +2,7 @@ import CESServerCore
 import Foundation
 import WinSDK
 
-@main struct SwiftEchoServer {
+struct SwiftEchoServer {
   static func writeUsage(_ handle: FileHandle) {
     handle.write(Data(cesUsageText.utf8))
   }
@@ -37,5 +37,8 @@ import WinSDK
       return .internalFailure
     }
   }
-  static func main() { ExitProcess(UInt32(run().rawValue)) }
 }
+
+// Top-level entry: main.swift holds the entry point so the file corresponds to main.cpp, main.rs
+// and main.zig in the sibling implementations.
+ExitProcess(UInt32(SwiftEchoServer.run().rawValue))
