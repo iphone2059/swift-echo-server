@@ -111,7 +111,7 @@ package func cesParseOptions(_ arguments: [[UInt16]]) throws(CESArgumentError) -
     let token = arguments[i]
     i += 1
     guard let offset = switchOffset(token) else {
-      throw CESArgumentError(message: "server does not accept positional arguments")
+      throw CESArgumentError(message: "unexpected-target")
     }
     let equal = token[offset...].firstIndex(of: 61)
     let name = asciiLower(token[offset..<(equal ?? token.count)])
@@ -192,7 +192,7 @@ package func cesParseOptions(_ arguments: [[UInt16]]) throws(CESArgumentError) -
   }
   if o.help { return o }
   guard o.protocolKind != .none else {
-    throw CESArgumentError(message: "missing /p tcp or /p udp")
+    throw CESArgumentError(message: "missing-protocol")
   }
   if o.protocolKind == .udp {
     if !sawRIOBuffer {
