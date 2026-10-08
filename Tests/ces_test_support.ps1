@@ -632,7 +632,7 @@ function Start-CESTestServer {
         [Parameter(Mandatory)] [string] $ErrorPath
     )
     return Start-Process -FilePath $Path -ArgumentList $Arguments -RedirectStandardOutput $OutputPath `
-        -RedirectStandardError $ErrorPath -PassThru -WindowStyle Hidden
+        -RedirectStandardError $ErrorPath -PassThru -NoNewWindow
 }
 
 function Stop-CESTestProcess {
