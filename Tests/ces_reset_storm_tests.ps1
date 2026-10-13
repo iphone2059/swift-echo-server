@@ -34,22 +34,32 @@ public static class CESResetStorm {
                     if (slot > total) { return; }
                     var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
                     socket.LingerState = new LingerOption(true, 0);
-                    try { socket.Connect(endpoint); Interlocked.Increment(ref resets); }
+                    try {
+                        if (!socket.ConnectAsync(endpoint).Wait(2000)) { throw new TimeoutException("reset connect timeout"); }
+                        Interlocked.Increment(ref resets);
+                    }
                     catch { }
                     finally { try { socket.Dispose(); } catch { } }
                 }
             });
         }
-        Task.WaitAll(tasks);
+        if (!Task.WaitAll(tasks, 15000)) throw new TimeoutException("reset storm timeout");
         return resets;
     }
     // One verified echo round trip.
     public static bool Echo(int port, byte[] payload) {
         try {
             using (var socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)) {
-                socket.Connect(new IPEndPoint(IPAddress.Loopback, port));
+                socket.SendTimeout = 2000;
+                socket.ReceiveTimeout = 2000;
+                if (!socket.ConnectAsync(new IPEndPoint(IPAddress.Loopback, port)).Wait(2000)) return false;
                 socket.NoDelay = true;
-                socket.Send(payload);
+                int sent = 0;
+                while (sent < payload.Length) {
+                    int count = socket.Send(payload, sent, payload.Length - sent, SocketFlags.None);
+                    if (count == 0) return false;
+                    sent += count;
+                }
                 var received = new byte[payload.Length];
                 int offset = 0;
                 while (offset < received.Length) {
@@ -90,7 +100,7 @@ $errorPath = Join-Path $env:TEMP ("ces_reset_" + [Guid]::NewGuid().ToString('N')
 New-Item -ItemType File -Path $outputPath, $errorPath -Force | Out-Null
 $server = Start-Process -FilePath $ServerPath -ArgumentList @(
     '/p', 'tcp', '/s', [string] $port, '/threads', '4', '/cq', '65536', '/memory', '1073741824',
-    '/w', [string] $ServerSeconds, '/stats') -PassThru -NoNewWindow -RedirectStandardOutput $outputPath -RedirectStandardError $errorPath
+    '/w', [string] $ServerSeconds, '/stats') -PassThru -WindowStyle Hidden -RedirectStandardOutput $outputPath -RedirectStandardError $errorPath
 try {
     if (-not (Wait-TcpReady -Port $port)) { throw "$Label did not start listening" }
     $resets = [CESResetStorm]::Run($port, $ResetConnections, 32)
@@ -115,7 +125,10 @@ try {
     if ($final -notmatch '^final protocol=tcp .* active=0') { throw "$Label terminal line missing: $final" }
     Write-Host "PASS $Label survives pre-accept resets: $resets reset connections, listener still echoing, final line '$([regex]::Match($final, 'accepted=\d+').Value)'"
 } finally {
-    if (-not $server.HasExited) { $server.Kill($true) }
+    if (-not $server.HasExited) {
+        $server.Kill($true)
+        if (-not $server.WaitForExit(5000)) { throw "$Label cleanup timeout" }
+    }
     $server.Dispose()
     Remove-Item -LiteralPath $outputPath, $errorPath -Force -ErrorAction SilentlyContinue
 }

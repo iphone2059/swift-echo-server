@@ -125,7 +125,7 @@ function Invoke-InteropScenario {
     } else {
         $serverArguments += @('/k', '256', '/cq', '8192', '/memory', '268435456')
     }
-    $server = Start-Process -FilePath $ServerPath -ArgumentList $serverArguments -PassThru -NoNewWindow ` -RedirectStandardOutput $serverOut -RedirectStandardError $serverErr
+    $server = Start-Process -FilePath $ServerPath -ArgumentList $serverArguments -PassThru -WindowStyle Hidden -RedirectStandardOutput $serverOut -RedirectStandardError $serverErr
     try {
         $ready = if ($Protocol -eq 'tcp') { Wait-TcpReady -Port $port } else { Wait-UdpEcho -Port $port }
         if (-not $ready) { throw "$Name server never became ready" }
@@ -152,8 +152,8 @@ function Invoke-InteropScenario {
             $clientFinal = @($result.Text -split "\r?\n" | Where-Object { $_ -match '^final ' }) | Select-Object -Last 1
             $serverFinal = @($serverText -split "\r?\n" | Where-Object { $_ -match '^final ' }) | Select-Object -Last 1
             if (-not $clientFinal -or -not $serverFinal) { throw "$Name final statistics line missing" }
-            $clientBytes = [regex]::Match($clientFinal, 'bytes=(\d+) ').Groups[1].Value
-            $serverBytes = [regex]::Match($serverFinal, 'bytes=(\d+) ').Groups[1].Value
+            $clientBytes = [regex]::Match($clientFinal, '(?:^| )bytes=(\d+)(?: |$)').Groups[1].Value
+            $serverBytes = [regex]::Match($serverFinal, '(?:^| )bytes=(\d+)(?: |$)').Groups[1].Value
             if (-not $clientBytes -or -not $serverBytes) { throw "$Name byte accounting missing" }
             if ([UInt64]$clientBytes -ne [UInt64]$serverBytes) {
                 throw "$Name byte mismatch client=$clientBytes server=$serverBytes"
@@ -161,7 +161,10 @@ function Invoke-InteropScenario {
         }
         Write-Host "PASS $Name (port $port, $([regex]::Match($serverText, 'bytes=\d+').Value)) (final line)"
     } finally {
-        if (-not $server.HasExited) { $server.Kill($true) }
+        if (-not $server.HasExited) {
+            $server.Kill($true)
+            if (-not $server.WaitForExit(5000)) { throw "$Name server cleanup timeout" }
+        }
         $server.Dispose()
         Remove-Item -LiteralPath $serverOut, $serverErr -Force -ErrorAction SilentlyContinue
     }
@@ -169,11 +172,12 @@ function Invoke-InteropScenario {
 if (-not $ClientPath) {
     throw 'swift-echo-client.exe was not found; interop acceptance requires the verified client'
 }
-Invoke-InteropScenario -Name 'swift client TCP' -Protocol tcp -ClientExe $ClientPath ` -ClientArguments @('127.0.0.1', '/p', 'tcp', '/r', '{port}', '/n', '500', '/k', '8', '/z', '4096', ` '/c', '8', '/threads', '4', '/q', '/stats') ` -Patterns @('echoed=500 ', 'corrupted=0 ', 'lost=0 ', 'network_errors=0 ')
-Invoke-InteropScenario -Name 'swift client UDP' -Protocol udp -ClientExe $ClientPath ` -ClientArguments @('127.0.0.1', '/p', 'udp', '/r', '{port}', '/n', '200', '/z', '1200', ` '/c', '4', '/threads', '2', '/q', '/stats') ` -Patterns @('echoed=200 ', 'corrupted=0 ', 'lost=0 ', 'network_errors=0 ') -ExactByteAccounting $false
+# /n is the shared per-session quota: 500*8 TCP and 200*4 UDP echoes.
+Invoke-InteropScenario -Name 'swift client TCP' -Protocol tcp -ClientExe $ClientPath ` -ClientArguments @('127.0.0.1', '/p', 'tcp', '/r', '{port}', '/n', '500', '/k', '8', '/z', '4096', ` '/c', '8', '/threads', '4', '/q', '/stats') ` -Patterns @('echoed=4000 ', 'corrupted=0 ', 'lost=0 ', 'network_errors=0 ')
+Invoke-InteropScenario -Name 'swift client UDP' -Protocol udp -ClientExe $ClientPath ` -ClientArguments @('127.0.0.1', '/p', 'udp', '/r', '{port}', '/n', '200', '/z', '1200', ` '/c', '4', '/threads', '2', '/q', '/stats') ` -Patterns @('echoed=800 ', 'corrupted=0 ', 'lost=0 ', 'network_errors=0 ') -ExactByteAccounting $false
 if ($CppClientPath -and (Test-Path -LiteralPath $CppClientPath -PathType Leaf)) {
-    Invoke-InteropScenario -Name 'cpp client TCP' -Protocol tcp -ClientExe $CppClientPath ` -ClientArguments @('127.0.0.1', '/p', 'tcp', '/r', '{port}', '/n', '500', '/k', '8', '/z', '4096', ` '/c', '8', '/threads', '4', '/q', '/stats') ` -Patterns @('echoed=500 ', 'corrupted=0 ', 'lost=0 ', 'network_errors=0 ')
-    Invoke-InteropScenario -Name 'cpp client UDP' -Protocol udp -ClientExe $CppClientPath ` -ClientArguments @('127.0.0.1', '/p', 'udp', '/r', '{port}', '/n', '200', '/z', '1200', ` '/c', '4', '/threads', '2', '/q', '/stats') ` -Patterns @('echoed=200 ', 'corrupted=0 ', 'lost=0 ', 'network_errors=0 ') -ExactByteAccounting $false
+    Invoke-InteropScenario -Name 'cpp client TCP' -Protocol tcp -ClientExe $CppClientPath ` -ClientArguments @('127.0.0.1', '/p', 'tcp', '/r', '{port}', '/n', '500', '/k', '8', '/z', '4096', ` '/c', '8', '/threads', '4', '/q', '/stats') ` -Patterns @('echoed=4000 ', 'corrupted=0 ', 'lost=0 ', 'network_errors=0 ')
+    Invoke-InteropScenario -Name 'cpp client UDP' -Protocol udp -ClientExe $CppClientPath ` -ClientArguments @('127.0.0.1', '/p', 'udp', '/r', '{port}', '/n', '200', '/z', '1200', ` '/c', '4', '/threads', '2', '/q', '/stats') ` -Patterns @('echoed=800 ', 'corrupted=0 ', 'lost=0 ', 'network_errors=0 ') -ExactByteAccounting $false
 } else {
     Write-Host 'SKIP cpp client scenarios (cpp-echo-client.exe not built)'
 }

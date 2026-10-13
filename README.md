@@ -1,70 +1,43 @@
 # swift-echo-server
 
-Swift 6.4 重写的 Windows x64 RIO Echo 服务端。参数、退出码、统计字段和收发路径沿用 C++ 服务端：数据面只有注册 I/O（RIO），RIO 完成队列通过 IOCP 通知工作线程，不存在普通 `send`/`recv`、数据面事件轮询或其他回退后端。
+> 2026-10-14：按用户要求暂停并提交 WIP 审查快照。本轮尚未运行完整格式化、编译和测试门禁；待完成事项见 [暂停交接](docs/REVIEW_CHECKPOINT_2026-10-14.md)，更新规范见 [跨语言规范](docs/CPP_Rust_Zig_Swift_Refactoring_Spec_v2.0.md)。
 
-## 架构
+Windows x64 Swift RIO Echo 服务端。数据面保持 Winsock RIO，完成队列通过 IOCP 通知；没有普通 send/recv 或其他后端。共同契约为 echo-binary-contract-v1。
 
-- TCP 接入：每个工作线程预投递 32 个 `AcceptEx`（总数上限 1024），完成由接入 IOCP 回收；已连接的 RIO socket 按轮转分配给固定工作线程，工作线程用同一 operation 地址回执握手。
-- TCP 数据：每个连接拥有一个 RIO RQ；每个工作线程独占一个 RIO CQ、一个 IOCP、一块预注册内存和一份索引最小堆。
-- UDP 数据：预投递固定深度的 `RIOReceiveEx`，完成后用 `RIOSendEx` 回显，再恢复接收。
-- CQ 唤醒：IOCP 只表示“RIO CQ 可读”；线程批量 `RIODequeueCompletion` 排空 CQ 后按需调用 `RIONotify`。通知是**惰性**的：只有在途请求存在时才登记注册，空闲工作线程不持有挂起的 `RIONotify`，因此释放前不需要取消或排空注册（`RIONotify` 在 CQ 非空时立即通知，投递与武装之间不会丢唤醒）。
-- 生命周期：接入只在全部 TCP 工作线程完成 IOCP/CQ/arena/定时器初始化后开放；停止时先关闭 `AcceptEx` 接入并 join 接入线程，再向工作线程发布 admission-closed 屏障与 stop，全部 join 后才释放注册资源。UDP 停止先关闭 socket 请求取消，再继续排空 CQ，注册内存、请求上下文和 CQ 在 `outstanding == 0` 前不会释放。
-- `RIONotify` 只有 `ERROR_SUCCESS` 被接受；`RIO_CORRUPT_CQ`、必需的通知失败和不可缺少的 IOCP 控制投递失败属于内部不变量损坏，进程以退出码 4 确定性终止，不重试、不轮询 CQ，也不切换后端。
-- 每个工作线程的数据面等待由 RIO CQ 通知和最近空闲截止时间驱动；TCP 协调器以最长 10 ms 采样停止与失败状态（`/w` 到期同样在此判定），接入线程和 UDP 循环使用最长 100 ms 的有界 IOCP 等待。这些控制等待不处理替代数据路径。
-- TCP 与 UDP 的单次 CQ 排空都在连续 64 个完成批次后把控制权交回主循环，并在排空内部检查停止标志与 `/w` 期限；饱和流量下停止不会无限期推迟（实测：满速 UDP 洪泛下 Ctrl+Break 约 1.07 s 退出、TCP 突发下约 0.99 s，均输出 `outstanding=0`/`active=0` 且 stderr 为空）。未取走的完成仍留在 CQ 并由下一次通知取回。
+Sources 下直接包含七个 Swift 文件，与 Rust/Zig 业务文件职责对应：
 
-## 构建与运行
+| 文件 | 职责 |
+| --- | --- |
+| main.swift | CLI、控制台 handler 注册和退出码 |
+| contract.swift | 参数、容量、page rounding、offset 与通知转换契约 |
+| types.swift | Event、Completion、Action、Failure、Lifecycle、统计数据 |
+| engine.swift | 不读取原生 I/O 状态的纯 TcpEngine |
+| internal.swift | Connection、AcceptorCore、UdpEngine、TimerHeap，以及 Worker/Acceptor/UDP Runtime 和 Transport |
+| native.swift | Win32/Winsock、固定地址存储、Socket/Handle/RIO/Arena 独占资源与诊断 |
+| server.swift | 装配、协调器、全线程 Join 屏障、最终统计 |
 
-要求 Windows 10 或更新版本、Swift 6.4 Windows 工具链及配套 Windows SDK、PowerShell 7。无第三方 Swift 包，不依赖相邻客户端或服务端源码。工具链及运行库须在 PATH 中。
+Swift 自动形成模块，Rust lib.rs 与 Zig root.zig 对应 Package.swift 的语言声明例外。CESServerCore 和 swift_echo_server target 用互斥 sources/exclude 清单共享扁平 Sources，没有同名子目录或占位索引文件。
+
+运行链是 Transport → Completion/Event → Runtime → Pure Engine → Action → Runtime → Transport。原生完成首先验证 context 身份、方向与已提交字节范围，核销 provider 账本后才交给 Engine。取消 socket 不清空在途账本。TCP/UDP 每个固定 stride slot 独立注册 RIO BufferId；负载在原注册区域回显。
+
+TCP 接入窗口为 clamp(workers * 2, 8, 128)。原子 AdmissionCredits 同时覆盖已连接会话和在途 handoff，容量感知分流避免可用 worker 被跳过。AcceptEx 支持同步完成、pending、三种连接级 reset、有限同步重试及 deferred repost。
+
+停止顺序：停止并 Join Acceptor，向全部 Worker 发布 AdmissionClosed/Stop，Join 全部 Worker，集中检查释放不变量，再释放。每个释放入口重复检查；arena 还持有私有 provider 账本，传零无法绕过。缺失最终完成在固定 5 秒 drain grace 后 fail-fast；到期前先有限处理已排队的 IOCP/CQ 完成。释放允许一条合法待交付 RIONotify，OVERLAPPED/context 地址保留到 CQ 和 IOCP 都关闭之后。
+
+构建需要匹配的 Windows Swift 工具链、SDK 与运行库，无第三方 Swift 包。
 
 ```powershell
 swift build -c release --product swift-echo-server
 $bin = swift build -c release --show-bin-path
-& "$bin/swift-echo-server.exe" /p tcp /s 7000 /threads 8 /cq 65536 /memory 2147483648 /stats
-& "$bin/swift-echo-server.exe" /p udp /s 7000 /k 4096 /cq 8192 /memory 1073741824 /stats
+& "$bin/swift-echo-server.exe" /p tcp /s 7000 /threads 8 /stats
+& "$bin/swift-echo-server.exe" /p udp /s 7000 /k 256 /stats
 & "$bin/swift-echo-server.exe" /h
 ```
 
-完整验证使用 `pwsh -NoProfile -File build_debug.ps1` 或 `build_release.ps1`：构建、Swift Testing、所有权编译正反例、源码策略、原生内存安全正反例、验证门回归、TCP/UDP 进程验收、扩展场景（含 Ctrl+Break 受控停止与宽字符参数），以及已经单独验收的 `swift-echo-client` 与 `cpp-echo-client` 对同一二进制的互操作（客户端逐字节校验回显，退出码 0 才表示没有损坏或丢失，并与服务端 `bytes` 对账）。所有子进程有超时，结束时清理。
+/threads 0 为自动 TCP worker 数（1..64）；UDP 只使用 1，拒绝显式大于 1。/w 0 表示不设期限。/memory 检查 page-rounded arena 预算；UDP 还要求 cq >= depth * 2 和完整 datagram 容量。/h 仅省略必需协议检查，不屏蔽错误参数或非法容量。
 
-当前 Swift 6.4 Windows 默认构建后端的 Release 测试运行器会遗漏测试 DLL，导致发现零个测试。验证脚本仅在单元测试阶段显式采用 `swift test -c release --build-system native`（Debug 同样采用 native），核心模块与测试均按对应配置编译；正式服务端构建仍使用默认后端。脚本拒绝零测试结果，具体证据见工具链文档。
+/stats 仅输出 aggregate final 行，字段依次为 protocol、elapsed_ms、workers、accepted、active、outstanding、completions、receives、sends、received_bytes、sent_bytes、bytes、network_errors、rejected、MiB_per_sec。关闭期间成功完成仍计流量，失败/取消仅计 completion；关闭后的取消不计 network error。bytes 为成功发送的字节。CES_DIAG_FILE 可记录停止后的通知快照。退出码：0 成功、1 参数无效、2 网络/准备失败、3 保留、4 不变量或 drain 超时。
 
-```powershell
-pwsh -NoProfile -File tests/ces_standalone_check.ps1 -Configuration release
-```
+完整门禁按 format.ps1 → build_release.ps1 → build_debug.ps1 执行，包含 CTest、非空 Swift Testing、所有权/安全编译正反例、进程/互操作/reset storm 与有界故障子进程。Tests/CESFaultDriver 为独立测试产品；生产 CLI 没有故障模式。FaultDriver 包含完成身份/长度、真实 Worker IOCP 停止与缺失完成账本、partial startup、释放正向对照和栈地址释放顺序证明。
 
-该命令将包复制到独立目录，排除原构建缓存，再运行同一完整验证，证明构建与测试不依赖相邻项目。
-
-## 参数与结果
-
-| 参数 | 默认值 / 语义 |
-|---|---|
-| `/p tcp\|udp` | 必填；不接受位置参数 |
-| `/s` | 端口 7；1..65535 |
-| `/t` | TCP 空闲超时 300 秒；1..4294967295；仅 TCP |
-| `/w` | 默认不设时限；指定后到期受控停止 |
-| `/b` | 0（系统默认）；`SO_SNDBUF`/`SO_RCVBUF`，0..2147483647 |
-| `/k` | UDP 并发深度 256；1..65536；仅 UDP |
-| `/threads` | 0 表示 min(max(CPU,1),32)；1..64 |
-| `/rio-buffer` | TCP 每槽 16384 字节；UDP 省略时取 65507，显式值不得小于 65507；512..1048576 |
-| `/cq` | 每 CQ 容量 4096；64..1048576 |
-| `/memory` | 注册内存上限 1073741824；≥1048576 |
-| `/q` | 接受但不改变输出；服务端仅在 `/stats` 时输出 |
-| `/stats` | 输出逐工作线程记录与 `final` 汇总 |
-| `/h`、`/help` | 打印用法并退出 0；语法与范围错误仍返回退出码 1，不会被 `/h` 掩盖 |
-
-开关接受 `/x`、`-x`、`--x` 与 `=值` 形式；开关名和 `tcp`/`udp` 值按 ASCII 大小写不敏感比较。未知开关、空值、给 flag 开关附加值、位置参数或越界数值都返回退出码 1。
-
-退出码：0 成功（含受控停止）、1 参数/负载无效、2 网络准备失败（bind、RIO/IOCP/容量）、3 未使用、4 内部错误。
-
-`/stats` 保留 TCP 的逐工作线程记录，并在所有工作线程加入、接入屏障关闭且 RIO 终态完成排空后输出 `final protocol=tcp ... active=0` 汇总。UDP 在通知状态解除且 `outstanding=0` 后输出 `final protocol=udp` 汇总。`bytes` 只累计成功 RIO 发送完成的字节，`MiB_per_sec` 使用至少 1 ms 的保护后运行时间；UDP 的 receive/completion 数还包含停止期间排空的终态完成，因此不把接收块数标为逻辑 echo 数。
-
-TCP 的 CQ 容量至少按每连接两个完成槽计算；UDP 至少按深度的两倍配置。回环结果主要反映本机协议栈、调度与内存路径，不代表真实网络或目标 NIC 的上限。
-
-## 实现与部署
-
-核心位于 `Sources/CESServerCore`；`Sources/swift_echo_server` 只是入口。原生资源使用 `~Copyable` 所有者、`UniqueArray` 与 borrow/mutate 访问器，负载视图使用 Span/MutableSpan，完成结果使用 InlineArray；停止标志和失败标志使用 Synchronization.Atomic。每个 Windows 工作线程独占连接表、请求上下文表、CQ、IOCP、注册 arena 与索引堆；RIO 上下文在解引用前按分配范围、对齐和字段身份校验。停止先关闭 socket，再排空完成、完成通知握手、join，最后释放资源。全程保持 Swift 6 并发、所有权与严格内存安全检查。
-
-运行目录须能找到 Swift 6.4 的 `swiftCore.dll`、`swiftWinSDK.dll`、`swiftSynchronization.dll`、`Foundation.dll`、`FoundationEssentials.dll` 及其传递依赖，同时具备 MSVC x64 运行库和 Windows UCRT。最直接的部署方式是安装匹配的 Swift 工具链并保留其运行库 PATH；单拷贝 exe 到没有运行库的机器不能运行。开发测试不需要额外服务。
-
-[与 C++ 基线的详细对照](docs/comparison.md)（契约、结构、验证覆盖、性能与资源表格）、[工具链与验证证据](docs/toolchain-interop.md)、[行为差异](docs/behavior-differences.md)、[性能测量](docs/performance.md)。
+CESFixedArray 采用 fallible HeapAlloc、checked extent、固定容量及有界访问，完整初始化后公开，仅析构已初始化元素。Worker/Acceptor/UDP 热路径不扩容、不新增动态协议分派、Task 或 actor。正式 E0 与性能排名仍需另行冻结发布产物、工具链、负载和测量预算；功能门禁不能代替性能结论。

@@ -26,10 +26,10 @@ package enum CESSwitchTable {
   package static let valueSwitches: [CESSwitch] = [
     CESSwitch(name: "s", minimum: 1, maximum: 65_535, scope: .both),
     CESSwitch(name: "t", minimum: 1, maximum: UInt64(UInt32.max), scope: .tcpOnly),
-    CESSwitch(name: "w", minimum: 1, maximum: UInt64(UInt32.max), scope: .both),
+    CESSwitch(name: "w", minimum: 0, maximum: UInt64(UInt32.max), scope: .both),
     CESSwitch(name: "b", minimum: 0, maximum: UInt64(Int32.max), scope: .both),
     CESSwitch(name: "k", minimum: 1, maximum: 65_536, scope: .udpOnly),
-    CESSwitch(name: "threads", minimum: 1, maximum: 64, scope: .both),
+    CESSwitch(name: "threads", minimum: 0, maximum: 64, scope: .both),
     CESSwitch(name: "rio-buffer", minimum: 512, maximum: 1_048_576, scope: .both),
     CESSwitch(name: "cq", minimum: 64, maximum: 1_048_576, scope: .both),
     CESSwitch(name: "memory", minimum: 1_048_576, maximum: UInt64.max, scope: .both),
@@ -42,10 +42,14 @@ package enum CESSwitchTable {
 
 /// The usage text: stdout for a valid /h, stderr for a usage error.
 package let cesUsageText = """
-Usage: swift-echo-server /p tcp|udp [/s port] [/t seconds] [/w seconds]
-       [/b bytes] [/k udp-depth] [/threads workers] [/rio-buffer bytes]
-       [/cq capacity] [/memory bytes] [/q] [/stats]
-Data I/O is always RIO; CQ notification is always IOCP. No fallback backend exists.
+Usage: swift-echo-server /p tcp|udp [/s port] [/t seconds] [/w seconds] [/b bytes]
+       [/k depth] [/threads workers] [/rio-buffer bytes]
+       [/cq capacity] [/memory bytes] [/q] [/stats] [/h]
+/t seconds: TCP idle timeout; UDP rejects /t.
+/k depth: UDP receive slots; TCP rejects /k.
+/threads 0: automatic TCP workers, min(active processors, 64); UDP uses 1.
+/w 0: no run limit. /memory bounds page-rounded registered arenas.
+/q suppresses nonessential output; /stats prints final; /h shows help.
 
 """
 package func cesCheckedProduct(_ a: UInt64, _ b: UInt64) -> UInt64? {
@@ -56,6 +60,22 @@ package func cesCheckedArenaBytes(slots: UInt64, stride: UInt64, memoryLimit: UI
   guard let bytes = cesCheckedProduct(slots, stride), bytes <= memoryLimit else { return nil }
   return bytes
 }
+package func cesSaturatingAdd(_ a: UInt64, _ b: UInt64) -> UInt64 {
+  let (value, overflow) = a.addingReportingOverflow(b)
+  return overflow ? UInt64.max : value
+}
+package func cesCheckedPageRoundedArenaBytes(slots: UInt64, stride: UInt64, memoryLimit: UInt64, page: UInt64) -> UInt64? {
+  guard page != 0, let bytes = cesCheckedProduct(slots, stride) else { return nil }
+  let (sum, overflow) = bytes.addingReportingOverflow(page - 1)
+  guard !overflow, let rounded = cesCheckedProduct(sum / page, page), rounded <= memoryLimit else { return nil }
+  return rounded
+}
+package func cesWorkerMemoryBudget(memory: UInt64, workers: UInt32, index: UInt32, page: UInt64) -> UInt64 {
+  guard workers != 0 && index < workers && page != 0 else { return 0 }
+  let pages = memory / page, count = UInt64(workers)
+  return (pages / count + (UInt64(index) < pages % count ? 1 : 0)) * page
+}
+package func cesAcceptOperationCount(_ workers: UInt32) -> UInt32 { min(max(workers > 64 ? 128 : workers * 2, 8), 128) }
 package func cesTCPConnectionCapacity(cqCapacity: UInt32, memorySlots: UInt64) -> UInt32 {
   let queueSlots = UInt64(cqCapacity / 2)
   let bounded = min(queueSlots, memorySlots)
@@ -100,15 +120,28 @@ private func numeric(_ value: [UInt16]) throws(CESArgumentError) -> UInt64 {
   }
   return result
 }
+private func cesValidUTF16(_ value: [UInt16]) -> Bool {
+  var index = 0
+  while index < value.count {
+    let unit = value[index]; index += 1
+    if (0xd800...0xdbff).contains(unit) {
+      guard index < value.count && (0xdc00...0xdfff).contains(value[index]) else { return false }
+      index += 1
+    } else if (0xdc00...0xdfff).contains(unit) { return false }
+  }
+  return true
+}
 package func cesParseOptions(_ arguments: [[UInt16]]) throws(CESArgumentError) -> CESOptions {
   guard !arguments.isEmpty else { throw CESArgumentError(message: "invalid parser arguments") }
   var o = CESOptions()
   var sawTimeout = false
   var sawUDPDepth = false
   var sawRIOBuffer = false
+  var sawWorkers = false
   var i = 1
   while i < arguments.count {
     let token = arguments[i]
+    guard cesValidUTF16(token) else { throw CESArgumentError(message: "invalid-utf16") }
     i += 1
     guard let offset = switchOffset(token) else {
       throw CESArgumentError(message: "unexpected-target")
@@ -116,12 +149,9 @@ package func cesParseOptions(_ arguments: [[UInt16]]) throws(CESArgumentError) -
     let equal = token[offset...].firstIndex(of: 61)
     let name = asciiLower(token[offset..<(equal ?? token.count)])
     let inline = equal.map { Array(token[($0 + 1)...]) }
-    if let inline, inline.isEmpty {
-      throw CESArgumentError(message: "switch requires a non-empty inline value")
-    }
     if ["q", "quiet", "stats", "h", "help"].contains(name) {
       guard inline == nil else {
-        throw CESArgumentError(message: "flag switch does not accept a value")
+        throw CESArgumentError(message: "unexpected-value")
       }
       switch name {
       case "q", "quiet": o.quiet = true
@@ -135,19 +165,21 @@ package func cesParseOptions(_ arguments: [[UInt16]]) throws(CESArgumentError) -
     else { throw CESArgumentError(message: CESArgumentToken.unknownSwitch) }
     let value: [UInt16]
     if let inline {
+      guard !inline.isEmpty else { throw CESArgumentError(message: "missing-value") }
       value = inline
     } else {
       guard i < arguments.count, !arguments[i].isEmpty, switchOffset(arguments[i]) == nil else {
-        throw CESArgumentError(message: "switch requires a non-empty value")
+        throw CESArgumentError(message: "missing-value")
       }
       value = arguments[i]
       i += 1
     }
+    guard cesValidUTF16(value) else { throw CESArgumentError(message: "invalid-utf16") }
     if name == "p" {
       switch asciiLower(value[...]) {
       case "tcp": o.protocolKind = .tcp
       case "udp": o.protocolKind = .udp
-      default: throw CESArgumentError(message: "/p requires tcp or udp")
+      default: throw CESArgumentError(message: CESArgumentToken.outOfRange)
       }
       continue
     }
@@ -155,10 +187,11 @@ package func cesParseOptions(_ arguments: [[UInt16]]) throws(CESArgumentError) -
     let range: ClosedRange<UInt64>
     switch name {
     case "s": range = 1...65_535
-    case "t", "w": range = 1...UInt64(UInt32.max)
+    case "t": range = 1...UInt64(UInt32.max)
+    case "w": range = 0...UInt64(UInt32.max)
     case "b": range = 0...UInt64(Int32.max)
     case "k": range = 1...65_536
-    case "threads": range = 1...64
+    case "threads": range = 0...64
     case "rio-buffer": range = 512...1_048_576
     case "cq": range = 64...1_048_576
     default: range = 1_048_576...UInt64.max
@@ -176,7 +209,7 @@ package func cesParseOptions(_ arguments: [[UInt16]]) throws(CESArgumentError) -
     case "k":
       o.udpDepth = UInt32(n)
       sawUDPDepth = true
-    case "threads": o.workerCount = UInt32(n)
+    case "threads": o.workerCount = UInt32(n); sawWorkers = true
     case "rio-buffer":
       o.rioBufferBytes = UInt32(n)
       sawRIOBuffer = true
@@ -190,16 +223,25 @@ package func cesParseOptions(_ arguments: [[UInt16]]) throws(CESArgumentError) -
   if o.protocolKind == .udp && sawTimeout {
     throw CESArgumentError(message: CESArgumentToken.protocolOption)
   }
-  if o.help { return o }
-  guard o.protocolKind != .none else {
-    throw CESArgumentError(message: "missing-protocol")
-  }
+  if o.protocolKind == .udp && sawWorkers && o.workerCount > 1 { throw CESArgumentError(message: CESArgumentToken.protocolOption) }
   if o.protocolKind == .udp {
+    o.workerCount = 1
     if !sawRIOBuffer {
       o.rioBufferBytes = UInt32(CESConstants.maximumUDPPayloadBytes)
     } else if UInt64(o.rioBufferBytes) < CESConstants.maximumUDPPayloadBytes {
-      throw CESArgumentError(message: "UDP /rio-buffer must be at least 65507 bytes")
+      throw CESArgumentError(message: "payload-size")
+    }
+    guard o.udpDepth <= o.cqCapacity / 2 else { throw CESArgumentError(message: "cq-capacity") }
+    guard let bytes = cesCheckedPageRoundedArenaBytes(slots: UInt64(o.udpDepth), stride: UInt64(o.rioBufferBytes) + UInt64(CESConstants.udpAddressBytes), memoryLimit: o.memoryBytes, page: cesPageBytes()), bytes <= UInt64(UInt32.max) else { throw CESArgumentError(message: "memory-capacity") }
+  }
+  if o.protocolKind == .tcp {
+    let workers = cesResolvedWorkerCount(o.workerCount, processors: cesActiveProcessorCount())
+    for index in 0..<workers {
+      let budget = cesWorkerMemoryBudget(memory: o.memoryBytes, workers: workers, index: index, page: cesPageBytes())
+      if cesTCPConnectionCapacity(cqCapacity: o.cqCapacity, memorySlots: budget / UInt64(o.rioBufferBytes)) == 0 { throw CESArgumentError(message: "memory-capacity") }
     }
   }
+  if o.help { return o }
+  guard o.protocolKind != .none else { throw CESArgumentError(message: "missing-protocol") }
   return o
 }

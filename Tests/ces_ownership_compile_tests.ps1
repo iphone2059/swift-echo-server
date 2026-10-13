@@ -15,7 +15,9 @@ $cesCases = if ($Phase -eq 'features') {
 } else {
     @(@('OwnersPositive', $true), @('OwnersCopyRejected', $false),
       @('OwnersUseAfterConsumeRejected', $false), @('BorrowedOwnerDestroyedRejected', $false),
-      @('SpanEscapeRejected', $false), @('ConfigurationCopyRejected', $false))
+      @('SpanEscapeRejected', $false), @('ConfigurationCopyRejected', $false),
+      @('FixedArrayPositive', $true), @('FixedArrayCopyRejected', $false),
+      @('FixedArrayBorrowedDestroyRejected', $false))
 }
 foreach ($cesCase in $cesCases) {
     $cesName = $cesCase[0]

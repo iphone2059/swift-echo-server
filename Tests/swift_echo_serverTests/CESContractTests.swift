@@ -42,44 +42,44 @@ private func cesMessage(_ values: String...) -> String? {
 }
 
 @Test func switchFormsAndCaseAreAccepted() throws {
-  let options = try cesParse("--p=UDP", "-S", "7000", "--THREADS=4", "/Rio-Buffer", "65507")
+  let options = try cesParse("--p=UDP", "-S", "7000", "--THREADS=1", "/Rio-Buffer", "65507")
   #expect(options.protocolKind == .udp)
   #expect(options.port == 7000)
-  #expect(options.workerCount == 4)
+  #expect(options.workerCount == 1)
   #expect(options.rioBufferBytes == 65_507)
 }
 
 @Test func flagsDoNotAcceptValues() {
-  #expect(cesMessage("/p", "tcp", "/stats=1") == "flag switch does not accept a value")
-  #expect(cesMessage("/p", "tcp", "/q=") == "switch requires a non-empty inline value")
-  #expect(cesMessage("/p", "tcp", "/s=") == "switch requires a non-empty inline value")
-  #expect(cesMessage("/p", "tcp", "/s") == "switch requires a non-empty value")
-  #expect(cesMessage("/p", "tcp", "/s", "/stats") == "switch requires a non-empty value")
-  #expect(cesMessage("/p", "tcp", "/unknown") == "unknown switch")
-  #expect(cesMessage("/p", "tcp", "positional") == "server does not accept positional arguments")
-  #expect(cesMessage("/p", "sctp") == "/p requires tcp or udp")
-  #expect(cesMessage("/s", "7000") == "missing /p tcp or /p udp")
+  #expect(cesMessage("/p", "tcp", "/stats=1") == "unexpected-value")
+  #expect(cesMessage("/p", "tcp", "/q=") == "unexpected-value")
+  #expect(cesMessage("/p", "tcp", "/s=") == "missing-value")
+  #expect(cesMessage("/p", "tcp", "/s") == "missing-value")
+  #expect(cesMessage("/p", "tcp", "/s", "/stats") == "missing-value")
+  #expect(cesMessage("/p", "tcp", "/unknown") == "unknown-switch")
+  #expect(cesMessage("/p", "tcp", "positional") == "unexpected-target")
+  #expect(cesMessage("/p", "sctp") == "out-of-range")
+  #expect(cesMessage("/s", "7000") == "missing-protocol")
 }
 
 @Test func valueRangesAreStrict() {
-  #expect(cesMessage("/p", "tcp", "/s", "0") == "unknown switch or value outside its valid range")
-  #expect(cesMessage("/p", "tcp", "/s", "65536") == "unknown switch or value outside its valid range")
-  #expect(cesMessage("/p", "tcp", "/threads", "0") == "unknown switch or value outside its valid range")
-  #expect(cesMessage("/p", "tcp", "/threads", "65") == "unknown switch or value outside its valid range")
-  #expect(cesMessage("/p", "tcp", "/cq", "63") == "unknown switch or value outside its valid range")
-  #expect(cesMessage("/p", "tcp", "/cq", "1048577") == "unknown switch or value outside its valid range")
-  #expect(cesMessage("/p", "tcp", "/rio-buffer", "511") == "unknown switch or value outside its valid range")
-  #expect(cesMessage("/p", "tcp", "/memory", "1048575") == "unknown switch or value outside its valid range")
-  #expect(cesMessage("/p", "tcp", "/t", "0") == "unknown switch or value outside its valid range")
-  #expect(cesMessage("/p", "tcp", "/w", "4294967296") == "unknown switch or value outside its valid range")
-  #expect(cesMessage("/p", "tcp", "/b", "2147483648") == "unknown switch or value outside its valid range")
-  #expect(cesMessage("/p", "tcp", "/s", "7000x") == "numeric switch has an invalid value")
+  #expect(cesMessage("/p", "tcp", "/s", "0") == "out-of-range")
+  #expect(cesMessage("/p", "tcp", "/s", "65536") == "out-of-range")
+  #expect(cesMessage("/p", "tcp", "/threads", "0") == nil)
+  #expect(cesMessage("/p", "tcp", "/threads", "65") == "out-of-range")
+  #expect(cesMessage("/p", "tcp", "/cq", "63") == "out-of-range")
+  #expect(cesMessage("/p", "tcp", "/cq", "1048577") == "out-of-range")
+  #expect(cesMessage("/p", "tcp", "/rio-buffer", "511") == "out-of-range")
+  #expect(cesMessage("/p", "tcp", "/memory", "1048575") == "out-of-range")
+  #expect(cesMessage("/p", "tcp", "/t", "0") == "out-of-range")
+  #expect(cesMessage("/p", "tcp", "/w", "4294967296") == "out-of-range")
+  #expect(cesMessage("/p", "tcp", "/b", "2147483648") == "out-of-range")
+  #expect(cesMessage("/p", "tcp", "/s", "7000x") == "invalid-number")
 }
 
 @Test func protocolSpecificSwitchesAreRejected() {
-  #expect(cesMessage("/p", "tcp", "/k", "8") == "/k is available only for UDP")
-  #expect(cesMessage("/p", "udp", "/t", "5") == "/t is available only for TCP")
-  #expect(cesMessage("/p", "tcp", "/k=8") == "/k is available only for UDP")
+  #expect(cesMessage("/p", "tcp", "/k", "8") == "protocol-option")
+  #expect(cesMessage("/p", "udp", "/t", "5") == "protocol-option")
+  #expect(cesMessage("/p", "tcp", "/k=8") == "protocol-option")
   let options = try? cesParse("/p", "tcp", "/t", "5", "/s", "7000")
   #expect(options?.timeoutSeconds == 5)
 }
@@ -87,7 +87,7 @@ private func cesMessage(_ values: String...) -> String? {
 @Test func maximumValuesAreAccepted() throws {
   let options = try cesParse(
     "/p", "tcp", "/s", "65535", "/t", "4294967295", "/w", "4294967295", "/b", "2147483647",
-    "/threads", "64", "/rio-buffer", "1048576", "/cq", "1048576", "/memory", "1048576")
+    "/threads", "64", "/rio-buffer", "1048576", "/cq", "1048576", "/memory", "67108864")
   #expect(options.port == 65_535)
   #expect(options.timeoutSeconds == UInt32.max)
   #expect(options.runSeconds == UInt32.max)
@@ -95,7 +95,7 @@ private func cesMessage(_ values: String...) -> String? {
   #expect(options.workerCount == 64)
   #expect(options.rioBufferBytes == 1_048_576)
   #expect(options.cqCapacity == 1_048_576)
-  #expect(options.memoryBytes == 1_048_576)
+  #expect(options.memoryBytes == 67_108_864)
 }
 
 @Test func helpNeverMasksMalformedArguments() {
@@ -103,9 +103,9 @@ private func cesMessage(_ values: String...) -> String? {
   #expect(help?.help == true)
   let long = try? cesParse("--help")
   #expect(long?.help == true)
-  #expect(cesMessage("/p", "tcp", "/h", "/nonsense") == "unknown switch")
-  #expect(cesMessage("/h", "/s", "0") == "unknown switch or value outside its valid range")
-  // /h returns before the semantic checks, exactly like the C++ baseline.
+  #expect(cesMessage("/p", "tcp", "/h", "/nonsense") == "unknown-switch")
+  #expect(cesMessage("/h", "/s", "0") == "out-of-range")
+  // Help skips the mandatory protocol only; semantic and capacity checks run first.
   #expect(cesMessage("/h", "/s", "7000") == nil)
   let tolerated = try? cesParse("/h", "/p", "tcp")
   #expect(tolerated?.help == true)
@@ -113,4 +113,21 @@ private func cesMessage(_ values: String...) -> String? {
 
 @Test func parserRejectsAnEmptyArgumentVector() {
   #expect(throws: CESArgumentError.self) { try cesParseOptions([]) }
+}
+
+// Current three reference servers agree on these semantic checks. They replace
+// the old pre-refactor Swift assertions, not an implementation-specific result.
+@Test func helpDoesNotMaskCapacityOrProtocolChecks() {
+  #expect(cesMessage("/h", "/p", "udp", "/threads", "4") == "protocol-option")
+  #expect(cesMessage("/h", "/p", "udp", "/k", "33", "/cq", "64") == "cq-capacity")
+  #expect(cesMessage("/h", "/p", "tcp", "/threads", "64", "/rio-buffer", "1048576", "/memory", "1048576") == "memory-capacity")
+  #expect(cesMessage("/p", "tcp", "/w", "0", "/threads", "0") == nil)
+  #expect(cesMessage("/p", "udp", "/threads", "0") == nil)
+}
+
+@Test func parserPreservesInvalidUtf16Diagnostic() {
+  var args = cesArguments(["/p", "tcp", "/s"])
+  args.append([0xd800])
+  do { _ = try cesParseOptions(args); Issue.record("invalid UTF16 accepted") }
+  catch { #expect(error.message == "invalid-utf16") }
 }

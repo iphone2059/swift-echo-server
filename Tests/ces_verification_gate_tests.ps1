@@ -35,7 +35,7 @@ else { Write-Host 'PASS gate rejects unrelated diagnostic containing Escape in f
 
 Copy-Item -LiteralPath (Join-Path $cesRoot 'Sources') -Destination $cesScratch -Recurse
 Copy-Item -LiteralPath (Join-Path $cesRoot 'Package.swift') -Destination $cesScratch
-$cesOwnerPath = Join-Path $cesScratch 'Sources/CESServerCore/CESOwnership.swift'
+$cesOwnerPath = Join-Path $cesScratch 'Sources/native.swift'
 if (-not (Test-Path -LiteralPath $cesOwnerPath -PathType Leaf)) { throw 'reviewed owner source missing from Sources/CESServerCore' }
 [IO.File]::AppendAllText($cesOwnerPath, "`n@safe`nprivate struct UnreviewedSafeStorage { var address: UnsafePointer<Int>? }`n", [Text.UTF8Encoding]::new($false))
 $cesRejectedAnnotation = $false
@@ -47,11 +47,11 @@ catch {
 if (-not $cesRejectedAnnotation) { $cesFailures.Add('source policy accepted an extra @safe in the reviewed owner file') }
 else { Write-Host 'PASS gate rejects extra @safe in the reviewed owner file' }
 # Restore the reviewed owner, then audit that no other source may declare @safe.
-Copy-Item -LiteralPath (Join-Path $cesRoot 'Sources/CESServerCore/CESOwnership.swift') -Destination $cesOwnerPath -Force
-$cesControlPath = Join-Path $cesScratch 'Sources/CESServerCore/CESControl.swift'
+Copy-Item -LiteralPath (Join-Path $cesRoot 'Sources/native.swift') -Destination $cesOwnerPath -Force
+$cesControlPath = Join-Path $cesScratch 'Sources/server.swift'
 if (-not (Test-Path -LiteralPath $cesControlPath -PathType Leaf)) {
     $cesControlPath = (Get-ChildItem -LiteralPath (Join-Path $cesScratch 'Sources') -Recurse -File -Filter '*.swift' |
-        Where-Object { $_.Name -ne 'CESOwnership.swift' } | Select-Object -First 1).FullName
+        Where-Object { $_.Name -ne 'native.swift' } | Select-Object -First 1).FullName
 }
 if (-not $cesControlPath) { throw 'source policy regression found no second source file under Sources' }
 [IO.File]::AppendAllText($cesControlPath, "`n@safe`nprivate struct UnreviewedSafeControl { var address: UnsafePointer<Int>? }`n", [Text.UTF8Encoding]::new($false))

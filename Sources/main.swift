@@ -14,7 +14,7 @@ struct SwiftEchoServer {
     let args: [[UInt16]]
     do { args = try cesWindowsArguments() } catch {
       cesReport(stage: error.stage, error: error.code)
-      return .internalFailure
+      return .network
     }
     let options: CESOptions
     do { options = try cesParseOptions(args) } catch {
@@ -26,14 +26,14 @@ struct SwiftEchoServer {
       help()
       return .success
     }
-    let control = CESSharedControl()
+    let control = cesProcessControl
     do {
       let registration = try CESConsoleRegistration(control: control)
       let result = cesRunServer(options: options, control: control)
       registration.keepAlive()
       return result
     } catch {
-      cesReport(stage: error.stage, error: error.code)
+      FileHandle.standardError.write(Data("SetConsoleCtrlHandler failed: \(UInt32(bitPattern: error.code))\n".utf8))
       return .internalFailure
     }
   }
