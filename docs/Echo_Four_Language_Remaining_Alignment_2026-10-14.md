@@ -1,12 +1,31 @@
 # Echo 四语言八仓库剩余对齐工作规约
 
-**版本：** v1.0（2026-10-14 静态源码审查版）  
+**版本：** v1.1（2026-10-15 执行状态及 C++ 模块拆分补充；保留 v1.0 审查快照）  
 **目标平台：** Windows x64；Winsock Registered I/O（RIO）、IOCP、ConnectEx、AcceptEx  
 **覆盖项目：** C++ / Rust / Zig / Swift，Client 与 Server 各一个，共八仓库  
 **契约：** `echo-binary-contract-v1`  
-**审查属性：** 只读 GitHub `main` 源码审查；**本次未编译、未运行 Windows 门禁、未修改或推送仓库**。文中“源码已实现”不等于“运行时已经验收”。
+**审查属性：** 第 1–13 节保留 2026-10-14 的只读 GitHub `main` 审查快照和原始要求；该次审查没有编译、运行门禁或推送。当前执行状态见下方第 0 节，后续构建及提交不能回填为原始审查当时已完成的证据。
 
-> **执行结论：** Swift Client 和 Server 已完成主要源码重组，但仍是 WIP 快照；先补齐故障驱动接线并修正经过复核的少量语义分歧，随后一次性运行 Swift Release/Debug 实际门禁。C++、Rust、Zig 没有发现需要整体重写的架构缺口；尚需解决 Handoff 异常政策分歧、公共验证器版本和能力清单、过时文档。项目目标是尽快冻结八个 Release 二进制、运行 **4×4×5** 跨语言正式对照，而不是无限叠加门禁。
+> **历史审查结论（2026-10-14）：** Swift Client 和 Server 当时仍是 WIP 快照，需补齐故障接线、裁决语义分歧及执行实际门禁。后续用户明确要求 SwiftPM-only，并于 2026-10-15 增加 C++ 对应模块与同名头文件拆分；原文的 CMake/CTest Swift 接线位置及“无需 C++ 整体结构调整”不再作为当前执行要求。项目的最终冻结、**4×4×5** 跨语言正式对照目标仍有效。
+
+## 0. 当前执行状态与补充要求（2026-10-15）
+
+| 范围 | 当前状态 | 证据与剩余限制 |
+| --- | --- | --- |
+| Swift Client | 已发布 `76b5a697f12aa9e29039ef0707661be96aae30a5`，Sources 平铺八文件；SwiftPM-only | 最终 Release10 全 11 门禁、Debug01 全 10 门禁退出 0；manifest 的 Package/Sources/EXE 哈希与当前文件一致 |
+| Swift Server | 已发布 `1908ea7f53b46b0177a4266efadc8d1802e1715b`，Sources 平铺七文件；SwiftPM-only | 最终 Release06、Debug02 各 11 门禁退出 0；源码及 EXE 哈希一致 |
+| CL-01 | 四语言已采用策略 A | 停机、全局失败、Listener 失效可撤回；健康状态 Accepted Socket 失效具名 fail-fast 4 / native_error=10038 |
+| 公共验证器与 Features | 八份脚本同一 SHA，四 Client 的能力相同、四 Server 的能力相同 | 包含通知诊断；脚本身份一致不替代最终八个二进制的互操作实证；有限 UDP 的宽松旧用例不能证明正式基线的全配额零丢包 |
+| C++ Client／Server | 用户已授权结构调整，当前进行源码拆分 | Client 八个 `.cpp`／七个同名 `.h`、Server 七个 `.cpp`／六个同名 `.h`；按 F2 文件组对应 Rust/Zig/Swift，真实状态机和职责也必须对应 |
+| 正式二进制冻结与性能 | 尚未完成本次四语言正式验收 | 必须使用 C++ 拆分后的完整门禁产物；保留此前 Rust Server 32 MiB interop 失败记录及缺失原始日志的诊断限制 |
+
+执行记录位于 `.superpowers/swift-alignment-2026-10-14/`。Swift 的构建 manifest 保留验证当时的提交前 WIP SHA 与 dirty 状态，不将其冒充当前 HEAD；完整源码哈希用于建立已验证源码与后续提交的对应关系。历史 checkpoint 与失败日志保持原样。
+
+当前构建顺序仍为全部计划源码与静态复审完成后，`format.ps1` → `build_release.ps1` → `build_debug.ps1`。C++ 保留 CMake/CTest；Swift 仅以 SwiftPM 构建和运行单元测试，由有界 PowerShell 运行完整原生、所有权、安全、故障、互操作、reset storm 和 Release IR 门禁。第 4、5、12 节的 Swift CMake/CTest 接线要求按此替换，覆盖范围不得减少。
+
+C++ Client 的对应文件组为 `main`、`contract`、`types`、`payload`、`metrics`、`native`、`internal`、`engine`；Server 为 `main`、`contract`、`types`、`native`、`internal`、`engine`、`server`。`.cpp` 平铺 `src`、除入口外的同名 `.h` 平铺 `include`。用户明确要求 `main.cpp` 直接包含 `wmain` 主函数逻辑，不保留 `main.h` 或 `cec_main`／`ces_main` 入口包装；编译器约束和 RIO 布局并入对应 `types`／`native`，不得遗失检查。Pure Engine 不读取 Socket、RQ/CQ、OVERLAPPED 或 Provider outstanding；Runtime 协调标准化 Event 与 Action。不能靠空文件、转发文件或 `.cpp` 互相包含达成名称和数量对齐。拆分前的 C++ 门禁和二进制不能验收新源码。
+
+完整执行计划：`.superpowers/swift-alignment-2026-10-14/cpp-module-plan-2026-10-15.md`；现行映射以 `docs/CPP_Rust_Zig_Swift_Refactoring_Spec_v2.0.md` 第 3 节为准。新 C++ 源码阶段关闭后再统一格式化、Release/Debug 门禁，全部通过才提交推送并核对远端 SHA。
 
 ---
 

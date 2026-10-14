@@ -2,7 +2,7 @@
 
 版本：v2.0（强一一对应、极端性能与安全约束版）
 
-修订日期：2026 年 10 月 14 日（工作区约定、实际源码映射与工具链通道复核）
+修订日期：2026 年 10 月 15 日（C++ 对应模块及头文件拆分、SwiftPM 构建约定）
 
 本规约覆盖 C++、Rust、Zig、Swift 的全部 12 个有向迁移组合。迁移必须保持领域抽象、源码职责、组件关系和可观察行为，同时满足预先冻结的性能与安全要求。允许使用目标编译器已经实现的最新语言特性，并逐项验证其可用性与生成代码。
 
@@ -31,7 +31,7 @@
 
 `C:\Users\Administrator\echo-project` 下的八个 Echo 仓库采用并行模式，各自保持独立源码、构建、测试、依赖和可执行文件。当前数据面为 Winsock RIO，完成与控制面为 IOCP，TCP 使用 ConnectEx／AcceptEx；本文列出的 I/O Ring 是其他项目可采用的实例，不授权 Echo 更换后端。
 
-本工作区的操作流程以根目录 [AGENTS.md](../AGENTS.md) 为硬约束：每个仓库只保留 `main`，直接在现有仓库修改，不创建分支或 worktree；开始修改前及推送完成后核对 `main...origin/main` 为 `0 0`。保留用户已有改动。源码、语义、架构对齐与静态复审全部完成后，统一执行 `format.ps1` → `build_release.ps1` → `build_debug.ps1`；Release、Debug 均运行 CTest 与 reset storm，全部通过才提交并推送 `main`，再核对远端 SHA 与本地一致。本约定替代历史计划中的 worktree 流程和提前编译测试步骤。需要保留的实验内容先归档到 `.superpowers` 下的压缩包或 bundle，再清理本次遗留内容；不得覆盖其他正在进行的工作。
+本工作区的操作流程以根目录 [AGENTS.md](../AGENTS.md) 为硬约束：每个仓库只保留 `main`，直接在现有仓库修改，不创建分支或 worktree；开始修改前及推送完成后核对 `main...origin/main` 为 `0 0`。保留用户已有改动。源码、语义、架构对齐与静态复审全部完成后，统一执行 `format.ps1` → `build_release.ps1` → `build_debug.ps1`；Release、Debug 均运行所属语言的完整测试和 reset storm，全部通过才提交并推送 `main`，再核对远端 SHA 与本地一致。C++ 保留 CMake/CTest；Swift 按用户于 2026-10-14 的要求仅使用 SwiftPM 构建与单元测试，原生、所有权、安全、故障进程、互操作、reset storm 与优化验证由有界 PowerShell 门禁执行；Rust、Zig 保留各自原生验证入口。本约定替代历史计划中的 worktree 流程和提前编译测试步骤。需要保留的实验内容先归档到 `.superpowers` 下的压缩包或 bundle，再清理本次遗留内容；不得覆盖其他正在进行的工作。
 
 当前共同二进制契约版本标记为 `echo-binary-contract-v1`，实际入口是八仓的 `tools/verification/contract-version.txt` 与同目录验收入口，结合冻结源码、共同测试及 [Zig Client 对等契约](../zig-echo-client/docs/parity-contract.md) 核对；该 ID 不表示存在同名 Markdown 文件。根目录 [echo-contract.md](echo-contract.md) 中 2026-10-03 的 FIFO 流装配、禁止 `RIO_MSG_WAITALL`、每 echo 延迟与 4096 桶描述未随当前实现同步，属于待更新的冲突记录，不能据其把当前 batch、WAITALL 与 64 桶生产统计改回旧算法。发现其他契约冲突须记录并共同处置，不能以迁移为名自行选择较宽松的验收要求。
 
@@ -102,32 +102,34 @@ F2 允许把预先声明的逻辑文件组作为映射单元，例如一组 .h�
 
 ### Echo 的具体文件映射
 
-Rust 与 Zig 保持 Client 9、Server 8 个生产源文件，包括真实模块入口 `lib.rs`／`root.zig`。Swift 对应 Client 8、Server 7 个生产源文件；SwiftPM 在根目录 `Package.swift` 中实际声明 target／module，这是唯一模块索引语言例外，不移动到 `Sources`，不创建空 `lib.swift`／`root.swift` 或整体转发文件凑数量。所有业务职责仍逐文件对应；新增 `WorkerCore`／`RioTransport`／`WorkerRuntime`／`UdpEngine` 等逻辑类型放入既有职责文件，禁止为抽象增加文件、热路径动态分派、每次调用的堆分配或无必要的参数搬运。
+Rust 与 Zig 保持 Client 9、Server 8 个生产源文件，包括真实模块入口 `lib.rs`／`root.zig`。Swift 对应 Client 8、Server 7 个生产源文件；SwiftPM 在根目录 `Package.swift` 中实际声明 target／module，不移动到 `Sources`，不创建空索引文件凑数量。用户于 2026-10-15 明确要求 C++ 也拆分对应模块，并让头文件与实现文件对应：C++ Client 为 8 个 `.cpp` 与 7 个同名 `.h`，Server 为 7 个 `.cpp` 与 6 个同名 `.h`。用户随后明确要求入口只保留 `main.cpp`，逻辑直接放 `wmain`，不创建 `main.h`，不增加 `cec_main`／`ces_main` 包装。其余 Client 7 对、Server 6 对以 F2 文件组映射对应业务文件，入口直接映射；不能将 15／13 个 C++ 物理文件声称为严格 F1 一一对应。CMake 的目标／源清单承担 C++ 构建索引；它与 SwiftPM 清单均属于真实构建声明的语言例外。
 
-| 共同职责 | Rust Client `src` | Zig Client `src` | Swift Client |
-| --- | --- | --- | --- |
-| 应用入口 | `main.rs` | `main.zig` | `Sources/main.swift` |
-| 模块入口 | `lib.rs` | `root.zig` | 根 `Package.swift` 的真实模块声明（语言例外） |
-| 选项、共同值与算术 | `types.rs` | `types.zig` | `Sources/types.swift` |
-| 参数与容量契约 | `contract.rs` | `contract.zig` | `Sources/contract.swift` |
-| 字节负载 | `payload.rs` | `payload.zig` | `Sources/payload.swift` |
-| 统计账本与生产延迟 | `metrics.rs` | `metrics.zig` | `Sources/metrics.swift` |
-| 原生 API 与资源所有者 | `native.rs` | `native.zig` | `Sources/native.swift` |
-| Session、Scheduler、Worker Core、Timer | `internal.rs` | `internal.zig` | `Sources/internal.swift` |
-| Transport、Worker Runtime、运行协调 | `engine.rs` | `engine.zig` | `Sources/engine.swift` |
+C++ 实现文件平铺于 `src`，除入口外的同名声明头平铺于 `include`；Swift 源文件平铺于 `Sources`。头文件声明对应模块的实体、接口和必要编译期约束，实现文件承载对应的实际函数职责，不以空文件、整体转发或包含其他 `.cpp` 的方式满足映射。现有编译器约束与 RIO 布局内容合并到对应职责的 `types`／`native` 文件组，检查不得丢失。所有业务职责仍逐模块对应；新增 `WorkerCore`／`RioTransport`／`WorkerRuntime`／`UdpEngine` 等逻辑类型放入既有职责文件，禁止为抽象增加文件、热路径动态分派、每次调用的堆分配或无必要的参数搬运。
 
-| 共同职责 | Rust Server `src` | Zig Server `src` | Swift Server |
-| --- | --- | --- | --- |
-| 应用入口 | `main.rs` | `main.zig` | `Sources/main.swift` |
-| 模块入口 | `lib.rs` | `root.zig` | 根 `Package.swift` 的真实模块声明（语言例外） |
-| 选项、共同值与统计 | `types.rs` | `types.zig` | `Sources/types.swift` |
-| 参数与容量契约 | `contract.rs` | `contract.zig` | `Sources/contract.swift` |
-| 原生 API 与资源所有者 | `native.rs` | `native.zig` | `Sources/native.swift` |
-| 纯 TCP Engine | `engine.rs` | `engine.zig` | `Sources/engine.swift` |
-| Acceptor、Connection、UDP、Worker、Timer 与对应 Runtime | `internal.rs` | `internal.zig` | `Sources/internal.swift` |
-| 协议装配与停止协调 | `server.rs` | `server.zig` | `Sources/server.swift` |
+| 共同职责 | C++ Client `src`／`include` | Rust Client `src` | Zig Client `src` | Swift Client |
+| --- | --- | --- | --- | --- |
+| 应用入口 | `main.cpp`（直接 `wmain`，无头文件） | `main.rs` | `main.zig` | `Sources/main.swift` |
+| 模块／构建索引 | 根 `CMakeLists.txt` 的真实目标声明（语言例外） | `lib.rs` | `root.zig` | 根 `Package.swift` 的真实模块声明（语言例外） |
+| 选项、共同值与算术 | `types.cpp`／`types.h` | `types.rs` | `types.zig` | `Sources/types.swift` |
+| 参数与容量契约 | `contract.cpp`／`contract.h` | `contract.rs` | `contract.zig` | `Sources/contract.swift` |
+| 字节负载 | `payload.cpp`／`payload.h` | `payload.rs` | `payload.zig` | `Sources/payload.swift` |
+| 统计账本与生产延迟 | `metrics.cpp`／`metrics.h` | `metrics.rs` | `metrics.zig` | `Sources/metrics.swift` |
+| 原生 API 与资源所有者 | `native.cpp`／`native.h` | `native.rs` | `native.zig` | `Sources/native.swift` |
+| Session、Scheduler、Worker Core、Timer | `internal.cpp`／`internal.h` | `internal.rs` | `internal.zig` | `Sources/internal.swift` |
+| Transport、Worker Runtime、运行协调 | `engine.cpp`／`engine.h` | `engine.rs` | `engine.zig` | `Sources/engine.swift` |
 
-以上为本次 Swift 对齐的验收目标，文件清单本身不证明当前实现已符合。C++ 当前生产 `src`／`include` 物理文件为 Client 7、Server 8，保留原有头文件／实现边界；其 `cec_*`／`ces_*` 内部职责须在实体及成组文件清单中对应，不能虚称 C++ Client 也有 9 个物理文件，不能据 Rust／Zig 数量擅自拆分 C++。C++ 编译器约束和 RIO 布局声明等语言专用项进入例外清单。
+| 共同职责 | C++ Server `src`／`include` | Rust Server `src` | Zig Server `src` | Swift Server |
+| --- | --- | --- | --- | --- |
+| 应用入口 | `main.cpp`（直接 `wmain`，无头文件） | `main.rs` | `main.zig` | `Sources/main.swift` |
+| 模块／构建索引 | 根 `CMakeLists.txt` 的真实目标声明（语言例外） | `lib.rs` | `root.zig` | 根 `Package.swift` 的真实模块声明（语言例外） |
+| 选项、共同值与统计 | `types.cpp`／`types.h` | `types.rs` | `types.zig` | `Sources/types.swift` |
+| 参数与容量契约 | `contract.cpp`／`contract.h` | `contract.rs` | `contract.zig` | `Sources/contract.swift` |
+| 原生 API 与资源所有者 | `native.cpp`／`native.h` | `native.rs` | `native.zig` | `Sources/native.swift` |
+| 纯 TCP Engine | `engine.cpp`／`engine.h` | `engine.rs` | `engine.zig` | `Sources/engine.swift` |
+| Acceptor、Connection、UDP、Worker、Timer 与对应 Runtime | `internal.cpp`／`internal.h` | `internal.rs` | `internal.zig` | `Sources/internal.swift` |
+| 协议装配与停止协调 | `server.cpp`／`server.h` | `server.rs` | `server.zig` | `Sources/server.swift` |
+
+以上是当前四语言对齐的验收目标，文件清单本身不证明实现已符合。必须检查每个文件组中的真实状态归属、接口、依赖方向、事件与 Action 顺序及原生释放边界；历史 C++ Client 7、Server 8 个物理文件的集中实现清单不再是本次拆分的目标，也不得用拆分前的二进制和门禁日志验收拆分后的源码。
 
 ## 4 共同抽象与数据表达
 
