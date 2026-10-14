@@ -2,6 +2,9 @@ import Testing
 
 @testable import CESServerCore
 
+// Current three reference servers agree on these semantic checks. They replace
+// the old pre-refactor Swift assertions, not an implementation-specific result.
+
 private func cesArguments(_ values: [String]) -> [[UInt16]] {
   [Array("swift-echo-server".utf16)] + values.map { Array($0.utf16) }
 }
@@ -16,7 +19,6 @@ private func cesMessage(_ values: String...) -> String? {
     return error.message
   }
 }
-
 @Test func defaultOptionsMatchTheBaseline() throws {
   let options = try cesParse("/p", "tcp", "/s", "7000")
   #expect(options.protocolKind == .tcp)
@@ -31,7 +33,6 @@ private func cesMessage(_ values: String...) -> String? {
   #expect(options.memoryBytes == 1_073_741_824)
   #expect(!options.quiet && !options.stats && !options.help)
 }
-
 @Test func udpDefaultsToTheMaximumPayloadBuffer() throws {
   let options = try cesParse("/p", "udp")
   #expect(options.rioBufferBytes == 65_507)
@@ -40,7 +41,6 @@ private func cesMessage(_ values: String...) -> String? {
   let explicit = try cesParse("/p", "udp", "/rio-buffer", "65507")
   #expect(explicit.rioBufferBytes == 65_507)
 }
-
 @Test func switchFormsAndCaseAreAccepted() throws {
   let options = try cesParse("--p=UDP", "-S", "7000", "--THREADS=1", "/Rio-Buffer", "65507")
   #expect(options.protocolKind == .udp)
@@ -48,7 +48,6 @@ private func cesMessage(_ values: String...) -> String? {
   #expect(options.workerCount == 1)
   #expect(options.rioBufferBytes == 65_507)
 }
-
 @Test func flagsDoNotAcceptValues() {
   #expect(cesMessage("/p", "tcp", "/stats=1") == "unexpected-value")
   #expect(cesMessage("/p", "tcp", "/q=") == "unexpected-value")
@@ -60,7 +59,6 @@ private func cesMessage(_ values: String...) -> String? {
   #expect(cesMessage("/p", "sctp") == "out-of-range")
   #expect(cesMessage("/s", "7000") == "missing-protocol")
 }
-
 @Test func valueRangesAreStrict() {
   #expect(cesMessage("/p", "tcp", "/s", "0") == "out-of-range")
   #expect(cesMessage("/p", "tcp", "/s", "65536") == "out-of-range")
@@ -75,7 +73,6 @@ private func cesMessage(_ values: String...) -> String? {
   #expect(cesMessage("/p", "tcp", "/b", "2147483648") == "out-of-range")
   #expect(cesMessage("/p", "tcp", "/s", "7000x") == "invalid-number")
 }
-
 @Test func protocolSpecificSwitchesAreRejected() {
   #expect(cesMessage("/p", "tcp", "/k", "8") == "protocol-option")
   #expect(cesMessage("/p", "udp", "/t", "5") == "protocol-option")
@@ -83,7 +80,6 @@ private func cesMessage(_ values: String...) -> String? {
   let options = try? cesParse("/p", "tcp", "/t", "5", "/s", "7000")
   #expect(options?.timeoutSeconds == 5)
 }
-
 @Test func maximumValuesAreAccepted() throws {
   let options = try cesParse(
     "/p", "tcp", "/s", "65535", "/t", "4294967295", "/w", "4294967295", "/b", "2147483647",
@@ -97,7 +93,6 @@ private func cesMessage(_ values: String...) -> String? {
   #expect(options.cqCapacity == 1_048_576)
   #expect(options.memoryBytes == 67_108_864)
 }
-
 @Test func helpNeverMasksMalformedArguments() {
   let help = try? cesParse("/h")
   #expect(help?.help == true)
@@ -110,24 +105,23 @@ private func cesMessage(_ values: String...) -> String? {
   let tolerated = try? cesParse("/h", "/p", "tcp")
   #expect(tolerated?.help == true)
 }
-
 @Test func parserRejectsAnEmptyArgumentVector() {
   #expect(throws: CESArgumentError.self) { try cesParseOptions([]) }
 }
-
-// Current three reference servers agree on these semantic checks. They replace
-// the old pre-refactor Swift assertions, not an implementation-specific result.
 @Test func helpDoesNotMaskCapacityOrProtocolChecks() {
   #expect(cesMessage("/h", "/p", "udp", "/threads", "4") == "protocol-option")
   #expect(cesMessage("/h", "/p", "udp", "/k", "33", "/cq", "64") == "cq-capacity")
-  #expect(cesMessage("/h", "/p", "tcp", "/threads", "64", "/rio-buffer", "1048576", "/memory", "1048576") == "memory-capacity")
+  #expect(
+    cesMessage("/h", "/p", "tcp", "/threads", "64", "/rio-buffer", "1048576", "/memory", "1048576")
+      == "memory-capacity")
   #expect(cesMessage("/p", "tcp", "/w", "0", "/threads", "0") == nil)
   #expect(cesMessage("/p", "udp", "/threads", "0") == nil)
 }
-
 @Test func parserPreservesInvalidUtf16Diagnostic() {
   var args = cesArguments(["/p", "tcp", "/s"])
   args.append([0xd800])
-  do { _ = try cesParseOptions(args); Issue.record("invalid UTF16 accepted") }
-  catch { #expect(error.message == "invalid-utf16") }
+  do {
+    _ = try cesParseOptions(args)
+    Issue.record("invalid UTF16 accepted")
+  } catch { #expect(error.message == "invalid-utf16") }
 }

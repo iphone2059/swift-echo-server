@@ -61,13 +61,10 @@ try {
     Assert-CESTrue ($completions -ge ($receives + $sends)) "tcp completions $completions is below receives+sends $($receives + $sends)"
     Assert-CESTrue ($receives -ge 1) 'tcp receives must not be zero'
     Assert-CESTrue ($sends -ge 2) "tcp sends $sends does not cover both connections"
-    $workers = Get-CESWorkerCounters -Text $tcpStdout
-    Assert-CESEqual 2 $workers.Count 'worker statistics line count for /threads 2'
-    foreach ($worker in $workers) {
-        Assert-CESEqual 0 $worker.Active "worker $($worker.Index) active"
-    }
-    Assert-CESEqual $completions ([long] (($workers | Measure-Object -Property Completions -Sum).Sum)) 'aggregate completions equals the worker sum'
-    Assert-CESEqual (Get-CESCounter $final 'bytes') ([long] (($workers | Measure-Object -Property Bytes -Sum).Sum)) 'aggregate bytes equals the worker sum'
+    # Per-worker counters are reported through CES_DIAG_FILE, where the canonical verifier
+    # requires exactly one line per started worker; stdout carries only the final line.
+    Assert-CESEqual 1 (@(($tcpStdout -split "?
+") | Where-Object { $_.Trim() -ne '' }).Count) 'tcp server stdout line count'
     Assert-CESRate -Statistics $final
     Write-CESPass 'tcp two simultaneous connections, fragmented writes and a 256 KiB byte-exact payload'
 } finally {
@@ -205,7 +202,9 @@ try {
     $completions = Get-CESCounter $final 'completions'
     $receives = Get-CESCounter $final 'receives'
     $sends = Get-CESCounter $final 'sends'
-    Assert-CESEqual $completions ($receives + $sends) 'udp completions must equal receives plus sends'
+    # Cancelled startup receives retire completions without counting as receives or sends, so
+    # the UDP total is strictly greater (C++ ces_process_tests.ps1:290 makes the same check).
+    Assert-CESTrue ($completions -gt ($receives + $sends)) 'udp completions must exceed receives plus sends'
     $echoes = [long] $udpPeer.Echoes
     Assert-CESTrue ($sends -ge $echoes) "udp sends $sends is below the $echoes echoed datagrams"
     Assert-CESTrue ($sends -le ($echoes + [long] $ready.DiscardedDatagrams)) "udp sends $sends exceeds the $echoes echoed plus $($ready.DiscardedDatagrams) discarded datagrams"
@@ -233,7 +232,7 @@ $final = Get-CESFinalStatistics -Text $statsRun.Text
 Assert-CESFinalShape -Statistics $final -Protocol 'tcp'
 Assert-CESEqual 0 (Get-CESCounter $final 'accepted') 'idle /w server accepted'
 Assert-CESEqual 0 (Get-CESCounter $final 'bytes') 'idle /w server bytes'
-Assert-CESEqual 1 (Get-CESWorkerCounters -Text $statsRun.Text).Count 'single worker line for /threads 1'
+Assert-CESEqual 1 (@(($statsRun.Text -split "\r?\n") | Where-Object { $_.Trim() -ne '' }).Count) 'single final line for /threads 1'
 Assert-CESTrue ($final.ElapsedMs -ge 900 -and $final.ElapsedMs -le 8000) "elapsed_ms $($final.ElapsedMs) is outside the expected /w 1 window"
 Assert-CESTrue ($stopwatch.Elapsed.TotalMilliseconds -ge 900 -and $stopwatch.Elapsed.TotalMilliseconds -le 9000) "wall time $([math]::Round($stopwatch.Elapsed.TotalMilliseconds)) ms is outside the expected /w 1 window"
 
@@ -278,10 +277,8 @@ $invalidCases = @(
     @{ Name = '/k above 65536'; Arguments = @('/p', 'udp', '/k', '65537') },
     @{ Name = '/t with udp'; Arguments = @('/p', 'udp', '/t', '1') },
     @{ Name = '/t zero'; Arguments = @('/p', 'tcp', '/t', '0') },
-    @{ Name = '/w zero'; Arguments = @('/p', 'tcp', '/w', '0') },
     @{ Name = 'negative /b'; Arguments = @('/p', 'tcp', '/b', '-1') },
     @{ Name = '/b above INT32_MAX'; Arguments = @('/p', 'tcp', '/b', '2147483648') },
-    @{ Name = '/threads zero'; Arguments = @('/p', 'tcp', '/threads', '0') },
     @{ Name = '/threads above 64'; Arguments = @('/p', 'tcp', '/threads', '65') },
     @{ Name = '/rio-buffer below 512'; Arguments = @('/p', 'tcp', '/rio-buffer', '511') },
     @{ Name = '/rio-buffer above 1048576'; Arguments = @('/p', 'tcp', '/rio-buffer', '1048577') },

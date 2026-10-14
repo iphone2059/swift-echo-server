@@ -1,3 +1,4 @@
+import Foundation
 import WinSDK
 import ucrt
 
@@ -5,6 +6,9 @@ import ucrt
 // The RIO extension table is initialized by WSAIoctl and used while Winsock is
 // active. AcceptEx entries belong to the listener socket and stay valid while that
 // socket lives. The CRT owns argv and guarantees NUL termination.
+
+// AcceptEx and GetAcceptExSockaddrs belong to the listener's Winsock provider.
+// The runtime validates the returned address views before publishing a handoff.
 
 package typealias CESNativeError = CESFailure
 package struct CESWinSockOwner: ~Copyable {
@@ -43,9 +47,6 @@ package func cesLoadRIO() throws(CESNativeError) -> RIO_EXTENSION_FUNCTION_TABLE
   }
   return rio
 }
-// Only AcceptEx is loaded: the AcceptEx output buffer is still required by the API,
-// but an echo server does not consume the parsed peer address, so
-// GetAcceptExSockaddrs is neither resolved nor called.
 package func cesLoadAcceptEx(listener: SOCKET) throws(CESNativeError) -> LPFN_ACCEPTEX {
   var acceptID = GUID(
     Data1: 0xb536_7df1, Data2: 0xcbac, Data3: 0x11cf,
@@ -63,7 +64,8 @@ package func cesLoadAcceptEx(listener: SOCKET) throws(CESNativeError) -> LPFN_AC
   }
   return unsafe acceptEx!
 }
-package func cesConfigureSocketFailure(_ socket: SOCKET, options: borrowing CESOptions, tcp: Bool) -> CESFailure?
+package func cesConfigureSocketFailure(_ socket: SOCKET, options: borrowing CESOptions, tcp: Bool)
+  -> CESFailure?
 {
   if options.socketBufferBytes > 0 {
     var size = Int32(options.socketBufferBytes)
@@ -89,9 +91,11 @@ package func cesConfigureSocketFailure(_ socket: SOCKET, options: borrowing CESO
   }
   return nil
 }
-package func cesConfigureSocket(_ socket: SOCKET, options: borrowing CESOptions, tcp: Bool) -> Bool {
+package func cesConfigureSocket(_ socket: SOCKET, options: borrowing CESOptions, tcp: Bool) -> Bool
+{
   if let failure = cesConfigureSocketFailure(socket, options: options, tcp: tcp) {
-    cesReport(stage: failure.stage, error: failure.code); return false
+    cesReport(stage: failure.stage, error: failure.code)
+    return false
   }
   return true
 }
@@ -114,13 +118,10 @@ package func cesWindowsArguments() throws(CESNativeError) -> [[UInt16]] {
   return result
 }
 
-import WinSDK
+// Safe ownership and bounded views; raw adoption/access still has an unsafe
+// pointer signature. The extent must match the adopted Windows allocation.
 
-// Native adoption/reset transfers sole ownership; callers must pass a live
-// resource and never reset to its already-owned value. Invalid sentinels are
-// never released. The RIO table pointer belongs to Winsock, which outlives owners.
-// Arena/CQ/registration owners are destroyed only after native cancellation drains
-// and every engine thread has joined (cesDestroyWorker enforces the preconditions).
+/// Owns a stable allocation. Native callbacks borrow this address until their owner joins.
 
 package struct CESSocketOwner: ~Copyable {
   package private(set) var rawValue: SOCKET
@@ -157,8 +158,6 @@ package struct CESHandleOwner: ~Copyable {
     }
   }
 }
-// Safe ownership and bounded views; raw adoption/access still has an unsafe
-// pointer signature. The extent must match the adopted Windows allocation.
 @safe
 package struct CESVirtualArenaOwner: ~Copyable {
   package private(set) var rawValue: UnsafeMutableRawPointer?
@@ -253,7 +252,6 @@ package struct CESRIOCQOwner: ~Copyable {
   }
   deinit { if let rawValue = unsafe rawValue { unsafe rio.RIOCloseCompletionQueue!(rawValue) } }
 }
-/// Owns a stable allocation. Native callbacks borrow this address until their owner joins.
 @unsafe
 package struct CESPinnedStorage<Element>: ~Copyable {
   package let count: Int
@@ -274,7 +272,8 @@ package struct CESPinnedStorage<Element>: ~Copyable {
   // that the enclosing release guard runs before this destructor can HeapFree it.
   package init(unsafeAdoptingHeapAllocation address: UnsafeMutablePointer<Element>, count: Int) {
     precondition(count > 0)
-    unsafe self.count = count; unsafe baseAddress = address
+    unsafe self.count = count
+    unsafe baseAddress = address
   }
   deinit {
     unsafe baseAddress.deinitialize(count: count)
@@ -284,25 +283,35 @@ package struct CESPinnedStorage<Element>: ~Copyable {
   }
 }
 
-import Foundation
-import WinSDK
-
-package func cesReport(stage: String, error: Int32) {
-  FileHandle.standardError.write(Data("\(stage) failed: native_error=\(error)\n".utf8))
-}
 // Internal invariant damage terminates deterministically with the internal exit code;
 // no retry, no completion-queue polling and no fallback data path exist.
-package func cesFailFast(stage: String, error: Int32) -> Never {
+
+// Fixed capacity, fallible storage. Only initialized elements can be borrowed;
+// callers cannot widen a view or move the underlying allocation. HeapAlloc's
+// Windows x64 alignment covers the POD values used here (at most 16 bytes).
+
+// One VirtualAlloc, one independent registration per concurrently owned slot.
+// Descriptor offsets are local to a registration, never global arena offsets.
+package func cesReport(stage: StaticString, error: Int32) {
+  FileHandle.standardError.write(Data("\(stage) failed: native_error=\(error)\n".utf8))
+}
+package func cesFailFast(stage: StaticString, error: Int32) -> Never {
   cesReport(stage: stage, error: error)
   while true { unsafe TerminateProcess(GetCurrentProcess(), 4) }
 }
-package func cesRequireRIONotifySuccess(_ status: Int32, stage: String) {
+package func cesRequireRIONotifySuccess(_ status: Int32, stage: StaticString) {
   if status == 10037 { cesFailFast(stage: "RIONotify duplicate arm", error: status) }
   if status != 0 { cesFailFast(stage: stage, error: status) }
 }
-package func cesRequireValidDequeueCount(_ count: UInt32, stage: String) -> UInt32 {
+package func cesRequireValidDequeueCount(_ count: UInt32, stage: StaticString) -> UInt32 {
   if count == UInt32.max { cesFailFast(stage: stage, error: 13) }
   return count
+}
+package func cesRequireAcceptCompletionExtent(_ transferred: UInt32) {
+  if transferred != 0 { cesFailFast(stage: "AcceptEx completion exceeds posted range", error: 13) }
+}
+package func cesRequireAcceptHandoffSocket(_ acceptedSocketValid: Bool) {
+  if !acceptedSocketValid { cesFailFast(stage: "AcceptEx handoff invariant", error: 10038) }
 }
 package func cesNotificationPacketMatches(
   key: UInt, overlapped: UnsafePointer<OVERLAPPED>?, expectedKey: UInt,
@@ -310,7 +319,7 @@ package func cesNotificationPacketMatches(
 ) -> Bool { unsafe key == expectedKey && overlapped == expectedOverlapped }
 package func cesRequireNotificationPacket(
   key: UInt, overlapped: UnsafePointer<OVERLAPPED>?, expectedKey: UInt,
-  expectedOverlapped: UnsafePointer<OVERLAPPED>?, stage: String
+  expectedOverlapped: UnsafePointer<OVERLAPPED>?, stage: StaticString
 ) {
   if unsafe !cesNotificationPacketMatches(
     key: key, overlapped: overlapped, expectedKey: expectedKey,
@@ -319,34 +328,42 @@ package func cesRequireNotificationPacket(
     cesFailFast(stage: stage, error: 13)
   }
 }
-package func cesRequireOutstanding(_ count: UInt32, stage: String) {
+package func cesRequireOutstanding(_ count: UInt32, stage: StaticString) {
   if count == 0 { cesFailFast(stage: stage, error: 13) }
 }
-package func cesRequireControlPostSuccess(_ succeeded: Bool, error: Int32, stage: String) {
+package func cesRequireControlPostSuccess(_ succeeded: Bool, error: Int32, stage: StaticString) {
   if !succeeded { cesFailFast(stage: stage, error: error) }
 }
-
-// Fixed capacity, fallible storage. Only initialized elements can be borrowed;
-// callers cannot widen a view or move the underlying allocation. HeapAlloc's
-// Windows x64 alignment covers the POD values used here (at most 16 bytes).
 @safe
 package struct CESFixedArray<Element>: ~Copyable {
   private let storage: UnsafeMutablePointer<Element>?
   package let count: Int
   package init(count: Int, repeating value: Element) throws(CESFailure) {
-    guard count >= 0 && MemoryLayout<Element>.alignment <= 16 else { throw .allocation("fixed array allocation") }
-    self.count = count
-    if count == 0 { unsafe storage = nil; return }
+    guard count >= 0 && MemoryLayout<Element>.alignment <= 16 else {
+      throw .allocation("fixed array allocation")
+    }
+    if count == 0 {
+      self.count = count
+      unsafe storage = nil
+      return
+    }
     let (bytes, overflow) = count.multipliedReportingOverflow(by: MemoryLayout<Element>.stride)
     guard !overflow, let raw = unsafe HeapAlloc(GetProcessHeap(), 0, UInt64(bytes)) else {
       throw .allocation("fixed array allocation")
     }
+    self.count = count
     unsafe storage = raw.bindMemory(to: Element.self, capacity: count)
     unsafe storage!.initialize(repeating: value, count: count)
   }
   package subscript(index: Int) -> Element {
-    get { precondition(index >= 0 && index < count); return unsafe storage![index] }
-    set { precondition(index >= 0 && index < count); unsafe storage![index] = newValue }
+    get {
+      precondition(index >= 0 && index < count)
+      return unsafe storage![index]
+    }
+    set {
+      precondition(index >= 0 && index < count)
+      unsafe storage![index] = newValue
+    }
   }
   deinit {
     if let storage = unsafe storage {
@@ -355,90 +372,130 @@ package struct CESFixedArray<Element>: ~Copyable {
     }
   }
 }
-
 package func cesPageBytes() -> UInt64 {
-  var information = SYSTEM_INFO()
+  var information = unsafe SYSTEM_INFO()
   unsafe GetSystemInfo(&information)
-  return UInt64(information.dwPageSize)
+  return unsafe UInt64(information.dwPageSize)
 }
 package func cesActiveProcessorCount() -> UInt32 { GetActiveProcessorCount(0xffff) }
-package func cesWin32Failure(_ stage: String) -> CESFailure {
+package func cesWin32Failure(_ stage: StaticString) -> CESFailure {
   CESFailure(domain: .win32, stage: stage, code: Int32(bitPattern: GetLastError()))
 }
-package func cesWinsockFailure(_ stage: String) -> CESFailure {
+package func cesWinsockFailure(_ stage: StaticString) -> CESFailure {
   CESFailure(stage: stage, code: WSAGetLastError())
 }
-package func cesRequireRelease(providerOutstanding: UInt32, businessOutstanding: UInt32, stage: String) {
+package func cesRequireRelease(
+  providerOutstanding: UInt32, businessOutstanding: UInt32, stage: StaticString
+) {
   if providerOutstanding != 0 || businessOutstanding != 0 { cesFailFast(stage: stage, error: 996) }
 }
-package func cesLoadAcceptAddresses(listener: SOCKET) throws(CESFailure) -> LPFN_GETACCEPTEXSOCKADDRS {
-  var identifier = GUID(Data1: 0xb5367df2, Data2: 0xcbac, Data3: 0x11cf, Data4: (0x95, 0xca, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92))
+package func cesLoadAcceptAddresses(listener: SOCKET) throws(CESFailure)
+  -> LPFN_GETACCEPTEXSOCKADDRS
+{
+  var identifier = GUID(
+    Data1: 0xb536_7df2, Data2: 0xcbac, Data3: 0x11cf,
+    Data4: (0x95, 0xca, 0x00, 0x80, 0x5f, 0x48, 0xa1, 0x92))
   var function: LPFN_GETACCEPTEXSOCKADDRS?
   var bytes: DWORD = 0
-  guard unsafe WSAIoctl(listener, DWORD(0xc8000006), &identifier, DWORD(MemoryLayout<GUID>.size), &function, DWORD(MemoryLayout<LPFN_GETACCEPTEXSOCKADDRS?>.size), &bytes, nil, nil) == 0, unsafe function != nil else {
+  guard
+    unsafe WSAIoctl(
+      listener, DWORD(0xc800_0006), &identifier, DWORD(MemoryLayout<GUID>.size), &function,
+      DWORD(MemoryLayout<LPFN_GETACCEPTEXSOCKADDRS?>.size), &bytes, nil, nil) == 0,
+    unsafe function != nil
+  else {
     throw cesWinsockFailure("SIO_GET_EXTENSION_FUNCTION_POINTER(GetAcceptExSockaddrs)")
   }
   return unsafe function!
 }
-
-// One VirtualAlloc, one independent registration per concurrently owned slot.
-// Descriptor offsets are local to a registration, never global arena offsets.
 @unsafe
 package struct CESRioArena: ~Copyable {
-  private var pages = CESVirtualArenaOwner()
+  private var pages: CESVirtualArenaOwner
   private var registrations: CESFixedArray<RIO_BUFFERID?>
   private let rio: RIO_EXTENSION_FUNCTION_TABLE
   package let stride: UInt32
   package let slotCount: UInt32
   private var providerOutstanding: UInt32 = 0
-  package init(rio: RIO_EXTENSION_FUNCTION_TABLE, slots: UInt32, stride: UInt32, memoryLimit: UInt64) throws(CESFailure) {
-    guard slots != 0 && stride != 0, let bytes = cesCheckedPageRoundedArenaBytes(slots: UInt64(slots), stride: UInt64(stride), memoryLimit: memoryLimit, page: cesPageBytes()), bytes != 0 && bytes <= UInt64(UInt32.max) else {
+  package init(
+    rio: RIO_EXTENSION_FUNCTION_TABLE, slots: UInt32, stride: UInt32, memoryLimit: UInt64
+  ) throws(CESFailure) {
+    guard slots != 0 && stride != 0,
+      let bytes = cesCheckedPageRoundedArenaBytes(
+        slots: UInt64(slots), stride: UInt64(stride), memoryLimit: memoryLimit, page: cesPageBytes()
+      ), bytes != 0 && bytes <= UInt64(UInt32.max)
+    else {
       throw .allocation("arena capacity")
     }
-    unsafe self.rio = rio; unsafe self.stride = stride; unsafe slotCount = slots
-    unsafe registrations = try CESFixedArray(count: Int(slots), repeating: Optional<RIO_BUFFERID>.none)
-    let address = unsafe VirtualAlloc(nil, bytes, DWORD(UInt32(MEM_RESERVE) | UInt32(MEM_COMMIT)), DWORD(PAGE_READWRITE))
+    var registrations = unsafe try CESFixedArray(
+      count: Int(slots), repeating: Optional<RIO_BUFFERID>.none)
+    var pages = unsafe CESVirtualArenaOwner()
+    let address = unsafe VirtualAlloc(
+      nil, bytes, DWORD(UInt32(MEM_RESERVE) | UInt32(MEM_COMMIT)), DWORD(PAGE_READWRITE))
     guard let address = unsafe address else { throw cesWin32Failure("VirtualAlloc(arena)") }
     unsafe pages.reset(address, byteCount: Int(bytes))
     for i in 0..<Int(slots) {
       let base = unsafe address.advanced(by: i * Int(stride)).assumingMemoryBound(to: CChar.self)
       guard let registration = unsafe rio.RIORegisterBuffer!(base, stride) else {
         let failure = cesWinsockFailure("RIORegisterBuffer(slots)")
-        for j in 0..<i { if let id = unsafe registrations[j] { unsafe rio.RIODeregisterBuffer!(id); unsafe registrations[j] = nil } }
+        for j in 0..<i {
+          if let id = unsafe registrations[j] {
+            unsafe rio.RIODeregisterBuffer!(id)
+            unsafe registrations[j] = nil
+          }
+        }
         unsafe pages.reset()
         throw failure
       }
       unsafe registrations[i] = registration
     }
+    unsafe self.rio = rio
+    unsafe self.stride = stride
+    unsafe slotCount = slots
+    unsafe self.registrations = consume registrations
+    unsafe self.pages = consume pages
   }
   package borrowing func view(index: UInt32, offset: UInt32, length: UInt32) -> RIO_BUF {
-    guard unsafe index < slotCount, unsafe offset <= stride, unsafe length <= stride - offset, let id = unsafe registrations[Int(index)] else {
+    guard unsafe index < slotCount, unsafe offset <= stride, unsafe length <= stride - offset,
+      let id = unsafe registrations[Int(index)]
+    else {
       cesFailFast(stage: "RIO registration window", error: 13)
     }
     var result = unsafe RIO_BUF()
-    unsafe result.BufferId = id; unsafe result.Offset = offset; unsafe result.Length = length
+    unsafe result.BufferId = id
+    unsafe result.Offset = offset
+    unsafe result.Length = length
     return unsafe result
   }
   package mutating func release(providerOutstanding: UInt32, businessOutstanding: UInt32) {
-    cesRequireRelease(providerOutstanding: providerOutstanding, businessOutstanding: businessOutstanding, stage: "RIO arena release precondition")
-    unsafe cesRequireRelease(providerOutstanding: self.providerOutstanding, businessOutstanding: 0, stage: "RIO arena provider ownership")
+    cesRequireRelease(
+      providerOutstanding: providerOutstanding, businessOutstanding: businessOutstanding,
+      stage: "RIO arena release precondition")
+    unsafe cesRequireRelease(
+      providerOutstanding: self.providerOutstanding, businessOutstanding: 0,
+      stage: "RIO arena provider ownership")
     unsafe deregister()
     unsafe pages.reset()
   }
   package mutating func didPost() { unsafe providerOutstanding += 1 }
   package mutating func didComplete() {
-    if unsafe providerOutstanding == 0 { cesFailFast(stage: "RIO arena completion ownership", error: 13) }
+    if unsafe providerOutstanding == 0 {
+      cesFailFast(stage: "RIO arena completion ownership", error: 13)
+    }
     unsafe providerOutstanding -= 1
   }
   private mutating func deregister() {
     for i in unsafe 0..<registrations.count {
-      if let id = unsafe registrations[i] { unsafe rio.RIODeregisterBuffer!(id); unsafe registrations[i] = nil }
+      if let id = unsafe registrations[i] {
+        unsafe rio.RIODeregisterBuffer!(id)
+        unsafe registrations[i] = nil
+      }
     }
   }
   deinit {
     // This owner guards its own trusted ledger, including scope exit and rollback.
     // A caller passing zero to release cannot erase provider ownership.
-    unsafe cesRequireRelease(providerOutstanding: providerOutstanding, businessOutstanding: 0, stage: "RIO arena provider ownership")
+    unsafe cesRequireRelease(
+      providerOutstanding: providerOutstanding, businessOutstanding: 0,
+      stage: "RIO arena provider ownership")
     for i in unsafe 0..<registrations.count {
       if let id = unsafe registrations[i] { unsafe rio.RIODeregisterBuffer!(id) }
     }

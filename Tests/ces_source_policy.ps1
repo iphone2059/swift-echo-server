@@ -13,7 +13,12 @@ if (@(Get-ChildItem -LiteralPath (Join-Path $root 'Sources') -Directory).Count -
 $all = ($sources | ForEach-Object { Get-Content -LiteralPath $_.FullName -Raw }) -join "`n"
 if ($all.Contains([char]0)) { throw 'NUL bytes in Swift source' }
 foreach ($rule in @(
-    '\b(?:send|recv|sendto|recvfrom|WSASend|WSARecv|WSASendTo|WSARecvFrom)\s*\(',
+    # Raw Winsock payload APIs. Member/declaration forms ('.send(', 'func send(', 'case send(')
+    # are the shared Action contract and must not be confused with a non-RIO call.
+    # The remaining names are unambiguous Win32 entry points.
+    '(?<![.\w])(?<!case )(?<!func )\b(?:send|recv)\s*\(',
+    '\b(?:sendto|recvfrom|WSASend|WSARecv|WSASendTo|WSARecvFrom)\s*\(',
+    '\bWinSDK\.(?:send|recv|sendto|recvfrom|WSASend|WSARecv)\s*\(',
     '@unchecked\s+Sendable',
     'FoundationNetworking|NWConnection|URLSession',
     'cpp-echo-client|cpp-echo-server|swift-echo-client',

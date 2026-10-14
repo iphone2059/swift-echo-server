@@ -484,7 +484,7 @@ C++ 异常、Rust panic、Swift 失败与 Zig panic 均在批准边界内处理�
 ### 验证顺序
 
 1. 冻结共同契约、映射、实际工具链与配置，完成计划内源码及静态复审；先审查实体、文件、架构、所有权和成本清单。
-2. 源码阶段完成后统一格式化，构建特性探针及完整产物；Echo 顺序为 `format.ps1` → `build_release.ps1` → `build_debug.ps1`，两种构建均包含 CTest 与 reset storm。
+2. 源码阶段完成后统一格式化，构建特性探针及完整产物；Echo 顺序为 `format.ps1` → `build_release.ps1` → `build_debug.ps1`。用户于 2026-10-14 明确要求 Swift 移除 CMake，Swift 两仓仅以 SwiftPM 负责构建与单元测试，PowerShell 有界执行原有所有权、内存安全、故障进程、互操作、reset storm 与 Release IR 门禁并保存真实退出码；不再依赖 CMake/CTest。其他语言保留自带构建与验证入口。
 3. 运行共同契约、差分、边界、故障、模糊和生命周期测试。
 4. 核对并发状态转换、完成次数、事件偏序和回收前提。
 5. 在目标 Windows 系统运行安全配置与最终发布配置。

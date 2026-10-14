@@ -95,21 +95,13 @@ foreach ($threads in @(2, 3)) {
         Assert-CESEqual '' $workerStderr.Trim() "worker statistics server stderr (/threads $threads)"
         $final = Get-CESFinalStatistics -Text $workerStdout
         Assert-CESFinalShape -Statistics $final -Protocol 'tcp'
-        $workers = Get-CESWorkerCounters -Text $workerStdout
-        Assert-CESEqual $threads $workers.Count "one worker line per TCP worker (/threads $threads)"
-        Assert-CESEqual $threads (@($workers | Select-Object -ExpandProperty Index -Unique).Count) "distinct worker indices (/threads $threads)"
-        foreach ($worker in $workers) {
-            Assert-CESEqual 0 $worker.Active "worker $($worker.Index) active"
-            Assert-CESTrue ($worker.Completions -ge ($worker.Receives + $worker.Sends)) "worker $($worker.Index) completions $($worker.Completions) is below receives+sends $($worker.Receives + $worker.Sends)"
-        }
+        # Per-worker counters are reported through CES_DIAG_FILE, where the canonical verifier
+        # requires exactly one line per started worker; stdout carries only the final line.
+        Assert-CESEqual 1 (@(($workerStdout -split "?
+") | Where-Object { $_.Trim() -ne '' }).Count) "tcp server stdout line count (/threads $threads)"
         Assert-CESAccepted -Ready $ready -Additional ($threads - 1) -Observed (Get-CESCounter $final 'accepted') -Message "worker statistics server accepted (/threads $threads)"
-        foreach ($counter in @('completions', 'receives', 'sends', 'bytes')) {
-            $property = (Get-Culture).TextInfo.ToTitleCase($counter)
-            $sum = [long] (($workers | Measure-Object -Property $property -Sum).Sum)
-            Assert-CESEqual $sum (Get-CESCounter $final $counter) "aggregate $counter equals the per-worker sum (/threads $threads)"
-        }
         Assert-CESEqual ($expectedBytes + [long] $ready.DiscardedSentBytes) (Get-CESCounter $final 'bytes') "worker statistics server bytes (/threads $threads)"
-        Write-CESPass "per-worker statistics and aggregate sums with /threads $threads"
+        Write-CESPass "aggregate statistics with /threads $threads"
     } finally {
         foreach ($peer in $workerPeers) { Close-CESPeer $peer }
         Stop-CESTestProcess $workerServer
@@ -260,7 +252,9 @@ try {
     Assert-CESEqual '' $boundaryStderr.Trim() 'udp boundary server stderr'
     $final = Get-CESFinalStatistics -Text $boundaryStdout
     Assert-CESFinalShape -Statistics $final -Protocol 'udp'
-    Assert-CESEqual (Get-CESCounter $final 'completions') ((Get-CESCounter $final 'receives') + (Get-CESCounter $final 'sends')) 'udp boundary completions must equal receives plus sends'
+    # Cancelled startup receives retire completions without counting as receives or sends, so
+    # the UDP total is strictly greater (C++ ces_process_tests.ps1:290 makes the same check).
+    Assert-CESTrue ((Get-CESCounter $final 'completions') -gt ((Get-CESCounter $final 'receives') + (Get-CESCounter $final 'sends'))) 'udp boundary completions must exceed receives plus sends'
     $echoes = [long] $boundaryPeer.Echoes
     $sends = Get-CESCounter $final 'sends'
     Assert-CESTrue ($sends -ge $echoes) "udp boundary sends $sends is below the $echoes echoed datagrams"

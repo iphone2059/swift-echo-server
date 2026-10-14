@@ -7,19 +7,31 @@ import Testing
   #expect(cesCheckedProduct(0, UInt64.max) == 0)
   #expect(cesCheckedProduct(UInt64.max, 2) == nil)
 }
-
 @Test func checkedArenaBytesHonoursTheMemoryLimit() {
   #expect(cesCheckedArenaBytes(slots: 4, stride: 16, memoryLimit: 64) == 64)
   #expect(cesCheckedArenaBytes(slots: 4, stride: 16, memoryLimit: 63) == nil)
   #expect(cesCheckedArenaBytes(slots: UInt64.max, stride: 2, memoryLimit: UInt64.max) == nil)
 }
-
+@Test func checkedPageRoundedArenaBytesChargesOnlyTheRoundedAllocation() {
+  #expect(
+    cesCheckedPageRoundedArenaBytes(slots: 5, stride: 1000, memoryLimit: 8192, page: 4096) == 5000)
+  #expect(
+    cesCheckedPageRoundedArenaBytes(slots: 5, stride: 1000, memoryLimit: 4096, page: 4096) == nil)
+  #expect(
+    cesCheckedPageRoundedArenaBytes(slots: 5, stride: 1000, memoryLimit: 8192, page: 0) == nil)
+  #expect(
+    cesCheckedPageRoundedArenaBytes(slots: 4, stride: 1024, memoryLimit: 4096, page: 4096) == 4096)
+  // The canonical UDP budget boundary: the logical size stays comparable with UInt32.max
+  // even though the page-rounded allocation charge is exactly 2^32.
+  #expect(
+    cesCheckedPageRoundedArenaBytes(
+      slots: 4097, stride: 1_048_320, memoryLimit: 4_294_967_296, page: 4096) == 4_294_967_040)
+}
 @Test func tcpConnectionCapacityTakesTheSmallerBound() {
   #expect(cesTCPConnectionCapacity(cqCapacity: 4_096, memorySlots: 1_000) == 1_000)
   #expect(cesTCPConnectionCapacity(cqCapacity: 4_096, memorySlots: 100_000) == 2_048)
   #expect(cesTCPConnectionCapacity(cqCapacity: 64, memorySlots: 1) == 1)
 }
-
 @Test func offsetAdvanceRejectsImpossibleTransfers() {
   var offset = 0
   let partial = cesAdvanceOffset(total: 10, transferred: 4, offset: &offset)
@@ -32,7 +44,6 @@ import Testing
   #expect(!past && !nothing && !negative)
   #expect(offset == 10)
 }
-
 @Test func udpSlotLookupRejectsAnythingOutsideTheSlotAllocation() {
   let count = 4
   let slots = UnsafeMutablePointer<CESUdpSlot>.allocate(capacity: count)
@@ -58,7 +69,6 @@ import Testing
   slots[2].index = 2
   #expect(cesUdpSlotForAddress(slots: slots, count: count, address: base + stride * 2) != nil)
 }
-
 @Test func notificationTransitionsAreOneWay() {
   var armed = false
   let deliveredWhileUnarmed = cesNotificationMarkDelivered(&armed)
@@ -72,7 +82,6 @@ import Testing
   #expect(delivered)
   #expect(!duplicateDelivery)
 }
-
 @Test func workerReleaseRequiresTheAdmissionBarrier() {
   var lifecycle = CESWorkerLifecycle(
     phase: .starting, activeConnections: 0, pendingHandoffs: 0, notificationArmed: false)
@@ -92,14 +101,12 @@ import Testing
   lifecycle.phase = .stopped
   #expect(cesWorkerMayExit(lifecycle))
 }
-
 @Test func udpReleaseRequiresAStoppedPhaseAndNoOutstandingWork() {
   #expect(!cesUdpMayRelease(phase: .running, outstanding: 0))
   #expect(!cesUdpMayRelease(phase: .draining, outstanding: 0))
   #expect(!cesUdpMayRelease(phase: .stopped, outstanding: 1))
   #expect(cesUdpMayRelease(phase: .stopped, outstanding: 0))
 }
-
 @Test func statisticsAccumulateWithoutLosingFields() {
   var total = CESEngineStatistics()
   let first = CESEngineStatistics(

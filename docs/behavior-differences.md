@@ -1,34 +1,40 @@
-# 与 C++ 基线的差异
+# 当前行为与语言表示差异
 
-正常协议行为、参数范围与诊断、AcceptEx 接入、RIO 数据通路、IOCP 工作线程、admission-closed 停止顺序、UDP 槽位复用、退出码与统计字段与 `cpp-echo-server` 一致。产品和帮助中的程序名改为 `swift-echo-server`；本仓库不实现客户端。
+本文描述 2026-10-14 恢复对齐后的源码事实。实际 Release/Debug 门禁与最终二进制验收另行记录；历史暂停记录 [REVIEW_CHECKPOINT_2026-10-14.md](REVIEW_CHECKPOINT_2026-10-14.md) 保留原样。
 
-## 所有权与布局
+正常协议、参数范围、AcceptEx 接入、Winsock RIO 数据通路、IOCP 线程、停止屏障、统计字段与退出码采用共同 `echo-binary-contract-v1`。程序名为 `swift-echo-server`，只实现服务端。
 
-- 工作线程配置是 `~Copyable`，连接表与 RIO 请求上下文表由 `CESPinnedStorage` 保持固定地址，socket 的所有权在 `UniqueArray<CESSocketOwner>`，接受操作的地址缓冲区由接受器唯一持有。
-- `AcceptEx` 的 `OVERLAPPED` 与 operation 记录同址：投递前校验其字段偏移为 0，完成包地址先按分配范围与步长校验，再映射回记录；工作线程收到的 handoff 键同样按范围与对齐校验。
-- RIO 注册与 CQ owner 保存函数表副本，避免函数表裸指针的寿命依赖。停止标志与失败标志使用 `Synchronization.Atomic`，控制对象在所有线程 join 前保持存活。
-- 原生字段地址由实际 `MemoryLayout` 偏移计算；不把 Swift 临时 inout 地址交给异步 API。
-- UDP 槽位表与通知 `OVERLAPPED` 使用显式固定分配并在作用域退出时释放，等价于基线的 `HeapAlloc` + owner；释放顺序为 CQ、通知、注册、槽位、arena、socket、端口。
-- 完整引擎没有声明 `@unchecked Sendable`，也不使用 Swift Task/actor 替代原生工作线程。
+## 分层和固定地址
 
-## 停止响应与排空
+- `CESTcpEngine`、`CESConnection`、`CESUdpEngine`、`CESAcceptorCore` 拥有业务状态、逻辑 outstanding 和 Action。原生 Transport 拥有 socket、RQ/CQ、OVERLAPPED、providerOperation 和 postedLength；完成先核算原生所有权，再交给纯引擎。
+- `Sources` 保持七个生产文件；SwiftPM 的真实 target 声明在 `Package.swift`，是 Rust `lib.rs` / Zig `root.zig` 的语言例外。
+- Worker、Acceptor、UDP 的原生记录与通知使用固定地址 `CESPinnedStorage`。Win32 `HeapAlloc`、checked extent 与初始化后才公开的固定数组承担主要元数据分配；原生记录的字段地址由 `MemoryLayout` 求得。
+- 一个 VirtualAlloc arena 内，每个并发 Slot 独立注册 RIO BufferId。TCP descriptor Offset 为 Slot 内发送偏移；UDP payload 与 remote address 在本 Slot 独有注册中使用局部偏移。
+- 独占 owner 使用 `~Copyable`、借用访问器和显式释放；RIO 函数表按值保存。没有热路径动态 protocol、Task/actor 或每 Completion 新建数组。
 
-- TCP 与 UDP 的单次 CQ 排空最多连续处理 64 个批次，然后检查停止标志与 `/w` 期限并返回主循环；基线一直排空到 CQ 为空。饱和流量下基线的停止包可能长时间得不到处理，Swift 版本让停止响应保持有界（实测满速洪泛下 ≤1.1 s 完成受控停止），排空内部一旦观察到停止或到期就关闭 socket、停止重投。未取走的完成仍留在 CQ，由下一次 `RIONotify` 通知取回。这是唯一有意保留的数据面时序差异。
-- 通知改为**惰性**：只有在途请求存在时才武装 `RIONotify`（TCP 判据为活动连接数非零，UDP 为 `outstanding != 0`），收到投递即取消武装，排空后若仍有在途请求再由主循环重新武装。因此空闲引擎不持有挂起注册，释放路径不再需要合成 IOCP 包或“放弃注册”迁移；两端在销毁 CQ 之前都会校验注册已解除，若仍为武装只报告诊断而不掩盖。
-- 工作线程退出仍要求 stop 与 admission-closed 都已处理且活动连接为 0；join 后校验 phase、活动连接、handoff、通知状态与定时器堆都满足释放前置条件。
-- 接受路径不做第二次状态查询：`GetQueuedCompletionStatus` 的成功/失败与 `GetLastError` 直接决定 AcceptEx 结果，不再调用 `WSAGetOverlappedResult`。对端地址在 acceptor 中只作为 AcceptEx 的输出缓冲区存在：echo 服务不消费它，因此既不在 worker 调用 `getpeername`，也不再解析 `GetAcceptExSockaddrs`（该扩展函数指针不再加载）；每新连接少三次调用，行为不变。
-- 启动失败的错误码在调用点就地捕获（`WSASocketW` 用 `WSAGetLastError`，`CreateIoCompletionPort`/`VirtualAlloc`/`CreateEventW` 用紧邻调用读取的 `GetLastError`），不再依赖稍后读取时仍有效的线程 last-error。
-- 客户端在 `AcceptEx` 完成前重置连接（`ERROR_NETNAME_DELETED`）按“连接级失败”处理：只关闭该 operation 的 socket 并重投 `AcceptEx`，监听与进程继续；其余完成错误仍保持基线的致命分类。这一条**不是移植差异**：`cpp-echo-server` 已同步修复（`ces_engine_accept_error_is_recoverable`），两侧都跑 `tests/ces_reset_storm_tests.ps1`（400 次预接受 RST + 随后正常回显 + 干净退出）。
-- 已接受的 socket 通过 operation 记录的裸值转移所有权：acceptor 在 handoff 前释放自己的 owner，worker 用该裸值构造 `CESSocketOwner` 接管，acceptor 在 ACK 与销毁时回收未被接管的残留 socket；worker 不再访问 acceptor 的容器。
+## 停止、完成与移交
 
-## 输出与诊断
+- 关闭 socket 只请求取消。providerOutstanding、providerOperation 和 arena 私有 provider 账本只在收到并核算真实完成时退休；同步投递拒绝只回滚未交给 Provider 的逻辑请求。
+- TCP/UDP 通知排空使用最多 64 批的有限预算。到期裁决前还有按 Slot 数界定的 IOCP/CQ 完成优先处理；首次 Close 锚定五秒宽限，不随重试延长。旧文档称 C++ 无界排空、Swift 独有 64 批策略的描述已过时。
+- `RIONotify` 在原生在途请求存在且未武装时投递，不合成通知。释放允许最多一条真实未交付通知；CQ 和 IOCP 都关闭前，通知与完成身份存储保持有效。
+- 协调器先停止并 Join Acceptor，再向所有已启动 Worker 发布 AdmissionClosed 和 Stop，Join 全部 Worker，集中检查全部释放条件，最后销毁。部分启动失败也包含已经创建但未宣告 ready 的线程。每个 destroy/release/deinit 保留内部所有权 Guard。
+- Acceptor Stop 校验 `providerOwned` 与 Core `Posted` 一致，仅关闭仍 Posted 的 accepted socket。Transit 属于已经发布的 Worker 移交，Acceptor 等 ACK；Deferred 等已排队的控制包。Credit 在拒绝或连接最终释放时恰好归还一次。
+- AcceptEx 完成使用 `GetQueuedCompletionStatus` 的结果与紧邻读取的原始错误，不再二次查询 `WSAGetOverlappedResult`；请求接收长度为零，非零完成字节在退休 Provider 前 fail-fast。成功接入依次执行 SO_UPDATE_ACCEPT_CONTEXT、socket 配置、GetAcceptExSockaddrs 地址校验、Admission Credit 和 Worker 发布。
+- 已统一健康状态异常政策 A：Stop、全局 Failed 或无效 Listener 撤回；健康 Listener 下无效 Accepted Socket 以 `AcceptEx handoff invariant` / 10038 退出 4。普通取消撤回不新增 Network Error。
+- 三种可恢复 AcceptEx Reset（64、10054、10053）只重投该 Slot；连续四次同步拒绝后排队一次 Deferred Repost。
 
-- 逐工作线程统计只在该工作线程确实创建过线程时输出。基线在启动失败路径上也会为从未启动的 worker 打印一行；Swift 版本只在 `/stats` 且线程已创建时输出。正常路径完全一致。
-- 参数解析、帮助文本、`final` 汇总字段与数字格式（POSIX locale，两位小数）与基线一致；`/q` 与基线一样不改变服务端输出。
-- 启动容量检查在协调器中完成（基线在工作线程初始化内完成），退出码同为 2，stderr 沿用相同的阶段名；因此容量不足时不会创建任何工作线程。
+## 统计、诊断和错误
 
-## 分配与环境边界
+- `/stats` 只输出 aggregate final 行：protocol、elapsed_ms、workers、accepted、active、outstanding、completions、receives、sends、received_bytes、sent_bytes、bytes、network_errors、rejected、MiB_per_sec。TCP workers 是实际创建的线程数，UDP 为 1；速率分母至少一毫秒。
+- 成功完成在 Closing 时仍记录 traffic。失败/取消都记录 completion，仅未 Closing 的失败增加 Network Error；bytes 是成功发送字节。UDP 10054 恢复完整接收容量，零字节 datagram 仍原长回显。
+- TCP RIO Post 拒绝终止并结账该连接；UDP Post 拒绝进入整 Socket Drain，但保留其他 Slot 的在途请求。Provider 所有权损坏和 Drain Timeout 退出 4，不能伪装为网络失败。
+- Native 错误在 API 失败点捕获。SO_UPDATE_ACCEPT_CONTEXT 失败按三个参考实现的现行共同政策静默计 Network Error 并停止接入；socket 配置失败只输出一次具名诊断。
+- `native_error` 采用当前 C++/Rust/Zig 一致的 signed Int32 展示。历史审查中 u32 展示的判断与当前三种源码不符，不据此改变实现。
+- `CES_DIAG_FILE` 记录停止后的通知快照，不改变 stdout 或退出码；TCP 在全 Worker Join 后写入，UDP 在排空和释放检查后写入。
 
-- `VirtualAlloc`、`HeapAlloc`、Winsock/RIO/线程/句柄 API 的失败按基线阶段报告。`UniqueArray`、Swift 类及引擎元数据使用标准库分配；真正耗尽这些分配时 Swift 运行库可能终止进程，无法保证映射到基线的可恢复退出码。
-- `/memory` 是注册 arena 的总限额（按工作线程均分），不是整个进程内存上限。
-- 必须提供匹配 Swift 6.4 的动态运行库；Windows x64 以外的平台不在此版本范围内。
+## 语言与验证边界
+
+- `try!` 便利构造器供冷路径契约测试使用；生产 TCP/UDP/Timer 初始化都使用可失败的 checked 构造器。原生分配失败保留 Failure；Swift class、String、Foundation 冷路径分配仍属于运行库分配边界。
+- 共享控制、失败标志和 Admission Credit 使用 Atomic；控制台回调仅发布 Atomic Stop，进程控制对象保留到进程结束。原生线程与 socket 移交依赖 Win32 就绪、Join 和 IOCP 发布/ACK 屏障。
+- StrictMemorySafety、不可复制 Optional 的消费/析构、`@c` 的 Windows 回调签名和优化后 ARC 成本必须由实际工具链验证。源码审查不替代编译、安全或性能证据。
+- `/memory` 限定注册 arena 预算，不是进程总内存上限。Windows x64、实际构建的 Swift 工具链/SDK/动态运行库是交付环境；历史 Swift 6.4 数据不代表新的开发快照产物。

@@ -31,10 +31,12 @@ function Find-CESWorkspace {
     return Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 }
 $cesWorkspace = Find-CESWorkspace
-$cesFlavor = if ($Configuration -eq 'release') { 'Release' } else { 'Debug' }
 if (-not $ClientPath) {
-    $cesCandidate = Join-Path $cesWorkspace "swift-echo-client/.build/out/Products/$cesFlavor-windows-x86_64/swift-echo-client.exe"
-    if (Test-Path -LiteralPath $cesCandidate) { $ClientPath = $cesCandidate }
+    $cesClientRoot = Join-Path $cesWorkspace 'swift-echo-client'
+    if (-not (Test-Path -LiteralPath (Join-Path $cesClientRoot 'Package.swift'))) { throw 'Swift client package is required for interop' }
+    $cesClientBin = (& swift build --package-path $cesClientRoot -c $Configuration --show-bin-path).Trim()
+    if ($LASTEXITCODE -ne 0) { throw 'SwiftPM client product path failed' }
+    $ClientPath = Join-Path $cesClientBin 'swift-echo-client.exe'
 }
 if (-not $CppClientPath) {
     $cesCandidate = Join-Path $cesWorkspace "cpp-echo-client/build/$Configuration/cpp-echo-client.exe"
@@ -112,8 +114,7 @@ function Invoke-InteropScenario {
         [bool] $ExactByteAccounting = $true
     )
     if (-not (Test-Path -LiteralPath $ClientExe -PathType Leaf)) {
-        Write-Host "SKIP $Name (client binary missing: $ClientExe)"
-        return
+        throw "$Name required client binary missing: $ClientExe"
     }
     $port = if ($Protocol -eq 'tcp') { Get-FreeTcpPort } else { Get-FreeUdpPort }
     $stamp = [Guid]::NewGuid().ToString('N')

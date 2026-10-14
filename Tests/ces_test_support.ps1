@@ -907,27 +907,6 @@ function Get-CESWorkerLines {
     return ,@($Text -split "\r?\n" | Where-Object { $_ -match '^\s*\[worker ' } | ForEach-Object { $_.Trim() })
 }
 
-function Get-CESWorkerCounters {
-    param([Parameter(Mandatory)] [AllowEmptyString()] [string] $Text)
-    $workers = @()
-    foreach ($line in (Get-CESWorkerLines -Text $Text)) {
-        if ($line -notmatch '^\[worker (\d+)\] accepted=(\d+) completions=(\d+) receives=(\d+) sends=(\d+) bytes=(\d+) active=(\d+)$') {
-            throw "worker statistics line does not match the contract (including no trailing fields): $line"
-        }
-        $workers += [pscustomobject]@{
-            Index       = [int] $Matches[1]
-            Accepted    = [long] $Matches[2]
-            Completions = [long] $Matches[3]
-            Receives    = [long] $Matches[4]
-            Sends       = [long] $Matches[5]
-            Bytes       = [long] $Matches[6]
-            Active      = [long] $Matches[7]
-            Line        = $line
-        }
-    }
-    return ,$workers
-}
-
 function Assert-CESUsageError {
     param(
         [Parameter(Mandatory)] [string] $Path,
@@ -1088,19 +1067,24 @@ function Assert-CESFinalShape {
         [Parameter(Mandatory)] $Statistics,
         [Parameter(Mandatory)] [string] $Protocol
     )
+    # The canonical verifier pins this exact numeric field set for both roles; protocol is
+    # the leading non-numeric field and is checked separately.
+    $numeric = @(
+        'elapsed_ms', 'workers', 'accepted', 'active', 'outstanding', 'completions', 'receives',
+        'sends', 'received_bytes', 'sent_bytes', 'bytes', 'network_errors', 'rejected',
+        'MiB_per_sec')
     if ($Protocol -eq 'tcp') {
         Assert-CESEqual 'tcp' $Statistics.Protocol 'final protocol'
-        Assert-CESEqual 8 $Statistics.Fields.Count "tcp final line field count ($($Statistics.Line))"
-        foreach ($name in @('elapsed_ms', 'accepted', 'completions', 'receives', 'sends', 'bytes', 'MiB_per_sec', 'active')) {
-            Assert-CESTrue ($Statistics.Fields.ContainsKey($name)) "tcp final line is missing the $name field: $($Statistics.Line)"
-        }
-        Assert-CESEqual 0 (Get-CESCounter $Statistics 'active') 'tcp final active'
     } else {
         Assert-CESEqual 'udp' $Statistics.Protocol 'final protocol'
-        Assert-CESEqual 7 $Statistics.Fields.Count "udp final line field count ($($Statistics.Line))"
-        foreach ($name in @('elapsed_ms', 'completions', 'receives', 'sends', 'bytes', 'MiB_per_sec', 'outstanding')) {
-            Assert-CESTrue ($Statistics.Fields.ContainsKey($name)) "udp final line is missing the $name field: $($Statistics.Line)"
-        }
+    }
+    Assert-CESEqual $numeric.Count $Statistics.Fields.Count "$Protocol final line field count ($($Statistics.Line))"
+    foreach ($name in $numeric) {
+        Assert-CESTrue ($Statistics.Fields.ContainsKey($name)) "$Protocol final line is missing the $name field: $($Statistics.Line)"
+    }
+    if ($Protocol -eq 'tcp') {
+        Assert-CESEqual 0 (Get-CESCounter $Statistics 'active') 'tcp final active'
+    } else {
         Assert-CESEqual 0 (Get-CESCounter $Statistics 'outstanding') 'udp final outstanding'
     }
 }

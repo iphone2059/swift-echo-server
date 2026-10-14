@@ -2,6 +2,8 @@ import CESServerCore
 import Foundation
 import WinSDK
 
+// Top-level entry: main.swift holds the entry point so the file corresponds to main.cpp, main.rs
+// and main.zig in the sibling implementations.
 struct SwiftEchoServer {
   static func writeUsage(_ handle: FileHandle) {
     handle.write(Data(cesUsageText.utf8))
@@ -33,12 +35,10 @@ struct SwiftEchoServer {
       registration.keepAlive()
       return result
     } catch {
-      FileHandle.standardError.write(Data("SetConsoleCtrlHandler failed: \(UInt32(bitPattern: error.code))\n".utf8))
+      FileHandle.standardError.write(
+        Data("SetConsoleCtrlHandler failed: \(UInt32(bitPattern: error.code))\n".utf8))
       return .internalFailure
     }
   }
 }
-
-// Top-level entry: main.swift holds the entry point so the file corresponds to main.cpp, main.rs
-// and main.zig in the sibling implementations.
 ExitProcess(UInt32(SwiftEchoServer.run().rawValue))
