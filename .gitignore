@@ -6,3 +6,5 @@ DerivedData/
 .swiftpm/configuration/registries.json
 .swiftpm/xcode/package.xcworkspace/contents.xcworkspacedata
 .netrc
+# Verification artifacts (latest.csv, latest-summary.csv, archive/, cases/)
+tools/verification/results/
