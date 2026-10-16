@@ -422,6 +422,9 @@ package struct CESTimerHeap: ~Copyable {
 package struct CESEngineRequest {
   package var connectionIndex: UInt32 = 0
   package var operation: CESEngineOperation = .receive
+  /// The generation that posted this context. The record address is stable for the slot's lifetime,
+  /// so the tag travels with it and a completion can be told apart from one of an earlier one.
+  package var generation: UInt32 = 0
   package init() {}
 }
 @unsafe
@@ -431,6 +434,9 @@ package struct CESEngineConnection {
   package var requestQueue: RIO_RQ?
   package var buffer = unsafe RIO_BUF()
   package var index: UInt32 = 0
+  /// Identity of the generation currently adopted into this slot. It changes only where a handoff
+  /// adopts the slot, so a stale completion can be rejected instead of attributed to this one.
+  package var generation: UInt32 = 0
   package var providerOperation: CESEngineOperation?
   package var postedLength: UInt32 = 0
   package init() {}
@@ -623,6 +629,7 @@ private func cesWorkerPost(
     index: index, offset: offset, length: length)
   let request = unsafe w.pointee.requestAddress!.advanced(by: Int(index))
   unsafe request.pointee.operation = operation
+  unsafe request.pointee.generation = unsafe c.pointee.generation
   let bufferOffset = unsafe MemoryLayout<CESEngineConnection>.offset(
     of: \CESEngineConnection.buffer)!
   let buffer = unsafe UnsafeMutableRawPointer(c).advanced(by: bufferOffset).assumingMemoryBound(
@@ -700,6 +707,9 @@ package func cesWorkerNormalizeCompletion(
   guard let operation = unsafe c.pointee.providerOperation,
     unsafe operation == request.pointee.operation, unsafe w.pointee.providerOutstanding != 0
   else { cesFailFast(stage: "worker completion without provider ownership", error: 13) }
+  guard unsafe request.pointee.generation == c.pointee.generation else {
+    cesFailFast(stage: "worker completion generation", error: 13)
+  }
   guard unsafe result.BytesTransferred <= c.pointee.postedLength else {
     cesFailFast(stage: "worker completion exceeds posted range", error: 13)
   }
@@ -791,6 +801,11 @@ private func cesWorkerTakeSocket(
   }
   unsafe c.pointee.socket = owner.release()
   unsafe c.pointee.requestQueue = rq
+  // This is the slot's only reuse point, so it is where the generation changes - before admit posts
+  // the first receive of the new generation. The tag is an identity rather than an ownership ledger,
+  // so it wraps to one at the limit.
+  let currentGeneration = unsafe c.pointee.generation
+  unsafe c.pointee.generation = currentGeneration == UInt32.max ? 1 : currentGeneration + 1
   let action = unsafe w.pointee.engine.admit(index: index, now: GetTickCount64())
   unsafe cesWorkerExecute(w, action)
   unsafe cesAckAccept(operation)
