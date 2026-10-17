@@ -48,6 +48,13 @@ package struct CESTcpEngine: ~Copyable {
       failure = .invariant("TCP free list")
       return
     }
+    let returned = connections[Int(index)]
+    // A slot comes back only when it holds nothing the provider could still reach: this route is the
+    // withdrawn handoff, where no operation of the generation was ever posted.
+    guard returned.outstanding == 0, returned.state == .idle || returned.state == .released else {
+      failure = .invariant("TCP return slot ownership")
+      return
+    }
     connections[Int(index)].state = .idle
     freeIndices[Int(freeCount)] = index
     freeCount += 1
@@ -58,7 +65,8 @@ package struct CESTcpEngine: ~Copyable {
   }
   package mutating func admit(index: UInt32, now: UInt64) -> CESAction? {
     guard index < slotCount,
-      connections[Int(index)].state == .idle || connections[Int(index)].state == .released
+      connections[Int(index)].state == .idle || connections[Int(index)].state == .released,
+      connections[Int(index)].outstanding == 0
     else {
       failure = .invariant("TCP admission state")
       return nil
