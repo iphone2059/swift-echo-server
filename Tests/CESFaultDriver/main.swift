@@ -5,7 +5,8 @@ import Synchronization
 import WinSDK
 
 func makeWorker(
-  rio: RIO_EXTENSION_FUNCTION_TABLE = RIO_EXTENSION_FUNCTION_TABLE(), index: UInt32 = 0
+  rio: RIO_EXTENSION_FUNCTION_TABLE = RIO_EXTENSION_FUNCTION_TABLE(), index: UInt32 = 0,
+  slots: UInt32 = 1, credits: UInt32 = 1
 ) throws(CESFailure) -> CESEngineWorker {
   var options = CESOptions()
   options.protocolKind = .tcp
@@ -15,10 +16,74 @@ func makeWorker(
   options.workerCount = 1
   let configuration = CESWorkerConfiguration(
     options: options, rio: rio, control: CESSharedControl(), failure: CESFailureFlag(),
-    credits: CESAdmissionCredits(capacity: 1), workerIndex: index, slotCount: 1,
+    credits: CESAdmissionCredits(capacity: credits), workerIndex: index, slotCount: slots,
     memoryShare: 1_048_576)
   return try CESEngineWorker(configuration: consume configuration)
 }
+/// Drives the production slot-ownership guards. Every case calls the engine the server runs, and a
+/// case that expects a refusal terminates with the stage that engine produced, so the harness
+/// observes the real boundary instead of a copy of it.
+func slotScenario(_ mode: String) throws(CESFailure) {
+  var worker = try makeWorker(slots: 2, credits: 2)
+  withUnsafeMutablePointer(to: &worker) { w in
+    func refuse(_ stage: String) -> Never {
+      guard let failure = w.pointee.engine.failure,
+        String(describing: failure.stage) == stage
+      else { cesFailFast(stage: "slot guard did not fire", error: 13) }
+      cesFailFast(stage: failure.stage, error: failure.code)
+    }
+    switch mode {
+    case "slot_cycle_positive":
+      guard let first = w.pointee.engine.takeSlot() else {
+        cesFailFast(stage: "slot take", error: 13)
+      }
+      w.pointee.engine.returnSlot(first)
+      guard let again = w.pointee.engine.takeSlot(), again == first else {
+        cesFailFast(stage: "slot retake", error: 13)
+      }
+      w.pointee.engine.returnSlot(again)
+      guard w.pointee.engine.failure == nil,
+        w.pointee.engine.freeCount == w.pointee.configuration.slotCount
+      else { cesFailFast(stage: "slot cycle state", error: 13) }
+      print("slot cycle accepted")
+    case "slot_return_duplicate":
+      // Take both slots, give one back, then give the same one back again.
+      guard let first = w.pointee.engine.takeSlot(), w.pointee.engine.takeSlot() != nil else {
+        cesFailFast(stage: "slot take", error: 13)
+      }
+      w.pointee.engine.returnSlot(first)
+      w.pointee.engine.returnSlot(first)
+      refuse("TCP return slot ownership")
+    case "slot_return_unowned":
+      // A slot that was never taken cannot be given back, even with room in the pool.
+      guard let taken = w.pointee.engine.takeSlot() else {
+        cesFailFast(stage: "slot take", error: 13)
+      }
+      w.pointee.engine.returnSlot(taken == 0 ? 1 : 0)
+      refuse("TCP return slot ownership")
+    case "slot_return_active":
+      guard let taken = w.pointee.engine.takeSlot() else {
+        cesFailFast(stage: "slot take", error: 13)
+      }
+      guard w.pointee.engine.admit(index: taken, now: 0) != nil else {
+        cesFailFast(stage: "slot admit", error: 13)
+      }
+      w.pointee.engine.returnSlot(taken)
+      refuse("TCP return slot ownership")
+    case "slot_admit_unreserved":
+      guard let taken = w.pointee.engine.takeSlot() else {
+        cesFailFast(stage: "slot take", error: 13)
+      }
+      w.pointee.engine.returnSlot(taken)
+      _ = w.pointee.engine.admit(index: taken, now: 0)
+      refuse("TCP admission state")
+    default:
+      cesFailFast(stage: "unknown slot mode", error: 13)
+    }
+    cesDestroyWorker(w)
+  }
+}
+
 func completionScenario(_ mode: String) throws(CESFailure) {
   var worker = try makeWorker()
   withUnsafeMutablePointer(to: &worker) { w in
@@ -369,6 +434,10 @@ func run() -> UInt32 {
       "completion_token", "completion_generation", "completion_socket_context", "completion_length",
       "completion_owner":
       try completionScenario(mode)
+    case "slot_cycle_positive", "slot_return_duplicate", "slot_return_unowned",
+      "slot_return_active",
+      "slot_admit_unreserved":
+      try slotScenario(mode)
     case "worker_release", "worker_release_order", "worker_release_positive", "slot_release",
       "slot_release_positive":
       try releaseScenario(mode)

@@ -1,9 +1,19 @@
 // Pure TCP aggregate. Native resources and provider ownership live in Transport;
 // this engine records requested operations, deadlines and echo decisions only.
+/// Slot ownership: the structural counterpart of the free list. The list says which slots are
+/// available, this table says who may use one, so a duplicate return or an adoption of a slot that
+/// was never reserved is refused instead of only being unlikely.
+package enum CESSlotOwnership: UInt8 {
+  case free
+  case reserved
+  case active
+  case draining
+}
 package struct CESTcpEngine: ~Copyable {
   private var connections: CESFixedArray<CESConnection>
   package var timers: CESTimerHeap
   private var freeIndices: CESFixedArray<UInt32>
+  private var ownership: CESFixedArray<CESSlotOwnership>
   package let slotCount: UInt32
   package private(set) var freeCount: UInt32
   package private(set) var activeCount: UInt32 = 0
@@ -23,6 +33,8 @@ package struct CESTcpEngine: ~Copyable {
     guard checkedSlotCount > 0 else { throw .allocation("TCP connection allocation") }
     var connections = try CESFixedArray(count: Int(checkedSlotCount), repeating: CESConnection())
     var freeIndices = try CESFixedArray(count: Int(checkedSlotCount), repeating: UInt32(0))
+    let ownership = try CESFixedArray(
+      count: Int(checkedSlotCount), repeating: CESSlotOwnership.free)
     let timers = try CESTimerHeap(checkedCapacity: checkedSlotCount)
     for i in 0..<Int(checkedSlotCount) {
       connections[i].index = UInt32(i)
@@ -33,6 +45,7 @@ package struct CESTcpEngine: ~Copyable {
     self.timeoutMilliseconds = timeoutMilliseconds
     self.connections = consume connections
     self.freeIndices = consume freeIndices
+    self.ownership = consume ownership
     self.timers = consume timers
   }
   package borrowing func connection(_ index: UInt32) -> CESConnection? {
@@ -40,21 +53,32 @@ package struct CESTcpEngine: ~Copyable {
   }
   package mutating func takeSlot() -> UInt32? {
     guard !stopping && freeCount > 0 else { return nil }
+    let index = freeIndices[Int(freeCount - 1)]
+    // Free -> Reserved. An entry whose slot is not free means the pool and the ownership table
+    // have diverged: hand out nothing rather than a slot someone still owns.
+    guard index < slotCount, ownership[Int(index)] == .free else {
+      failure = .invariant("TCP take slot ownership")
+      return nil
+    }
     freeCount -= 1
-    return freeIndices[Int(freeCount)]
+    ownership[Int(index)] = .reserved
+    return index
   }
   package mutating func returnSlot(_ index: UInt32) {
     guard index < slotCount && freeCount < slotCount else {
       failure = .invariant("TCP free list")
       return
     }
-    let returned = connections[Int(index)]
-    // A slot comes back only when it holds nothing the provider could still reach: this route is the
+    // Reserved -> Free. Only a slot that was taken and never admitted may come back, it may come
+    // back once, and it must hold nothing the provider could still reach: this route is the
     // withdrawn handoff, where no operation of the generation was ever posted.
-    guard returned.outstanding == 0, returned.state == .idle || returned.state == .released else {
+    guard ownership[Int(index)] == .reserved,
+      connections[Int(index)].outstanding == 0
+    else {
       failure = .invariant("TCP return slot ownership")
       return
     }
+    ownership[Int(index)] = .free
     connections[Int(index)].state = .idle
     freeIndices[Int(freeCount)] = index
     freeCount += 1
@@ -65,12 +89,14 @@ package struct CESTcpEngine: ~Copyable {
   }
   package mutating func admit(index: UInt32, now: UInt64) -> CESAction? {
     guard index < slotCount,
+      ownership[Int(index)] == .reserved,
       connections[Int(index)].state == .idle || connections[Int(index)].state == .released,
       connections[Int(index)].outstanding == 0
     else {
       failure = .invariant("TCP admission state")
       return nil
     }
+    ownership[Int(index)] = .active
     var c = connections[Int(index)]
     c.admit(now: now, timeout: timeoutMilliseconds)
     c.outstanding = 1
@@ -88,10 +114,15 @@ package struct CESTcpEngine: ~Copyable {
   }
   private mutating func release(_ index: UInt32) -> CESAction {
     var c = connections[Int(index)]
-    guard c.outstanding == 0, activeCount != 0 else {
+    // A slot may only re-enter the free list from a generation that owns nothing: never a slot
+    // that is already free (a duplicate release) or still reserved (never adopted).
+    guard c.outstanding == 0, activeCount != 0,
+      ownership[Int(index)] == .active || ownership[Int(index)] == .draining
+    else {
       failure = .invariant("TCP release ownership")
       return .close(index: index)
     }
+    ownership[Int(index)] = .free
     _ = timers.remove(connectionIndex: index)
     c.state = .idle
     c.echoBytes = 0
@@ -109,6 +140,13 @@ package struct CESTcpEngine: ~Copyable {
     }
     var c = connections[Int(index)]
     guard c.isActive && c.state != .closing else { return nil }
+    // Active -> Draining: the generation admits no further normal work until its posted
+    // operations have retired.
+    guard ownership[Int(index)] == .active else {
+      failure = .invariant("TCP close ownership")
+      return nil
+    }
+    ownership[Int(index)] = .draining
     let step = c.close(now: now)
     connections[Int(index)] = c
     if case .release = step { return release(index) }
