@@ -29,20 +29,44 @@ func completionScenario(_ mode: String) throws(CESFailure) {
     w.pointee.requestAddress = requests.baseAddress
     w.pointee.connections = consume connections
     w.pointee.requests = consume requests
-    let first = UInt(bitPattern: w.pointee.requestAddress!)
-    w.pointee.requestRange = first..<(first + UInt(MemoryLayout<CESEngineRequest>.stride))
     w.pointee.connectionAddress!.pointee.owner = w
+    w.pointee.connectionAddress!.pointee.generation = 1
     w.pointee.connectionAddress!.pointee.providerOperation = .receive
     w.pointee.connectionAddress!.pointee.postedLength = 8
     w.pointee.providerOutstanding = 1
+    guard
+      let token = CESRequestContext.encode(
+        index: 0, generation: 1, serial: 1, tag: CESRequestContext.receiveTag),
+      let queueIdentity = CESRequestContext.encode(
+        index: 0, generation: 1, serial: 0, tag: CESRequestContext.requestQueueTag)
+    else { cesFailFast(stage: "fault context encode", error: 13) }
+    w.pointee.requestAddress!.pointee.token = token
     var result = RIORESULT()
-    result.RequestContext = UInt64(first)
+    result.RequestContext = token
+    result.SocketContext = queueIdentity
     result.BytesTransferred = 4
     if mode == "completion_range" {
-      result.RequestContext = UInt64(w.pointee.requestRange.upperBound)
+      // A context that names a slot this worker does not own.
+      result.RequestContext =
+        CESRequestContext.encode(
+          index: 1, generation: 1, serial: 1, tag: CESRequestContext.receiveTag) ?? 0
     }
-    if mode == "completion_alignment" { result.RequestContext += 1 }
+    if mode == "completion_forged" { result.RequestContext |= 1 << 47 }
     if mode == "completion_identity" { w.pointee.connectionAddress!.pointee.index = 1 }
+    if mode == "completion_token" {
+      result.RequestContext =
+        CESRequestContext.encode(
+          index: 0, generation: 1, serial: 2, tag: CESRequestContext.receiveTag) ?? 0
+    }
+    if mode == "completion_generation" {
+      // The queue names the live generation while the posted token still names the retired one, so
+      // the generation guard is the boundary that has to fire.
+      w.pointee.connectionAddress!.pointee.generation = 2
+      result.SocketContext =
+        CESRequestContext.encode(
+          index: 0, generation: 2, serial: 0, tag: CESRequestContext.requestQueueTag) ?? 0
+    }
+    if mode == "completion_socket_context" { result.SocketContext = 0 }
     if mode == "completion_length" { result.BytesTransferred = 9 }
     if mode == "completion_owner" { w.pointee.connectionAddress!.pointee.providerOperation = nil }
     let completion = cesWorkerNormalizeCompletion(w, result: result)
@@ -50,6 +74,9 @@ func completionScenario(_ mode: String) throws(CESFailure) {
       completion.index == 0 && completion.bytes == 4 && completion.operation == .receive
         && w.pointee.providerOutstanding == 1
     else { cesFailFast(stage: "completion positive result", error: 13) }
+    // The drain loop retires the lane together with the provider accounting; this scenario calls the
+    // normalize boundary directly, so it retires both here.
+    w.pointee.requestAddress!.pointee.token = 0
     w.pointee.connectionAddress!.pointee.providerOperation = nil
     w.pointee.providerOutstanding = 0
     cesDestroyWorker(w)
@@ -74,11 +101,15 @@ func releaseScenario(_ mode: String) throws(CESFailure) {
       }
       return
     }
-    guard let records = CESPinnedStorage(count: 1, initialValue: CESEngineConnection()) else {
+    guard let records = CESPinnedStorage(count: 1, initialValue: CESEngineConnection()),
+      let lanes = CESPinnedStorage(count: 1, initialValue: CESEngineRequest())
+    else {
       cesFailFast(stage: "fault allocation", error: 8)
     }
     w.pointee.connectionAddress = records.baseAddress
     w.pointee.connections = consume records
+    w.pointee.requestAddress = lanes.baseAddress
+    w.pointee.requests = consume lanes
     if mode == "slot_release" {
       w.pointee.connectionAddress!.pointee.providerOperation = .receive
       cesWorkerReleaseSlot(w, index: 0)
@@ -334,8 +365,9 @@ func run() -> UInt32 {
       cesRequireAcceptHandoffSocket(true)
       print("accept handoff socket accepted")
     case "handoff_invalid_socket": cesRequireAcceptHandoffSocket(false)
-    case "completion_positive", "completion_range", "completion_alignment", "completion_identity",
-      "completion_length", "completion_owner":
+    case "completion_positive", "completion_range", "completion_forged", "completion_identity",
+      "completion_token", "completion_generation", "completion_socket_context", "completion_length",
+      "completion_owner":
       try completionScenario(mode)
     case "worker_release", "worker_release_order", "worker_release_positive", "slot_release",
       "slot_release_positive":

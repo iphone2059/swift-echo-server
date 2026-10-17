@@ -416,15 +416,95 @@ package struct CESTimerHeap: ~Copyable {
       min(UInt64(UInt32.max - 1), nodes[0].deadline > now ? nodes[0].deadline - now : 0))
   }
 }
+/// Request-context codec. The packed value is immutable: slot, operation, the generation that
+/// posted it and a per-slot submission serial are captured when the request is submitted, and the
+/// provider returns them unchanged, so a completion still describes its own submission after the
+/// slot record has been rewritten for a later generation. A pointer into that record cannot express
+/// this, because the retire path would read whatever the reuse point has written since. The value
+/// travels through APIs typed as an address and is never dereferenced.
+@unsafe
+package enum CESRequestContext {
+  package static let requestQueueTag: UInt64 = 1
+  package static let sendTag: UInt64 = 2
+  package static let receiveTag: UInt64 = 3
+
+  private static let slotBits: UInt64 = 16
+  private static let generationBits: UInt64 = 8
+  private static let serialBits: UInt64 = 20
+  private static let tagBits: UInt64 = 3
+  private static let generationShift: UInt64 = slotBits
+  private static let serialShift: UInt64 = generationShift + generationBits
+  private static let tagShift: UInt64 = serialShift + serialBits
+  private static let contextBits: UInt64 = tagShift + tagBits
+  private static let slotMask: UInt64 = (1 << slotBits) - 1
+  private static let generationMask: UInt64 = (1 << generationBits) - 1
+  private static let serialMask: UInt64 = (1 << serialBits) - 1
+  private static let tagMask: UInt64 = (1 << tagBits) - 1
+  private static let contextMask: UInt64 = (1 << contextBits) - 1
+
+  /// Generations wrap at the width the context carries. A generation number is only reused after
+  /// its slot drained, so the reuse cannot alias a request that is still live.
+  package static func nextGeneration(_ current: UInt32) -> UInt32 {
+    (current == 0 || current >= UInt32(generationMask)) ? 1 : current + 1
+  }
+
+  /// Submission serials wrap. Uniqueness inside one generation comes from the one-outstanding-
+  /// operation invariant and from comparing the token with the posted lane exactly, so a wrapped
+  /// value can only alias a completion that stayed unretired for a further 2^20 submissions.
+  package static func nextSerial(_ current: UInt32) -> UInt32 {
+    current >= UInt32(serialMask) ? 1 : current + 1
+  }
+
+  package static func encode(index: UInt32, generation: UInt32, serial: UInt32, tag: UInt64)
+    -> UInt64?
+  {
+    guard UInt64(index) <= slotMask, generation != 0,
+      UInt64(generation) <= generationMask, UInt64(serial) <= serialMask,
+      tag != 0, tag <= tagMask, serial == 0 ? tag == requestQueueTag : tag != requestQueueTag
+    else { return nil }
+    return (UInt64(index) & slotMask)
+      | ((UInt64(generation) & generationMask) << generationShift)
+      | ((UInt64(serial) & serialMask) << serialShift)
+      | ((tag & tagMask) << tagShift)
+  }
+
+  /// Rejects rather than masks anything outside the canonical payload, so a corrupted or forged
+  /// completion key cannot alias a live request.
+  package static func decode(_ context: UInt64) -> (
+    index: UInt32, generation: UInt32, operation: CESEngineOperation?
+  )? {
+    guard context != 0, context & ~contextMask == 0 else { return nil }
+    let tag = (context >> tagShift) & tagMask
+    let serial = (context >> serialShift) & serialMask
+    let generation = (context >> generationShift) & generationMask
+    let index = context & slotMask
+    guard generation != 0, UInt64(UInt32.max) >= index else { return nil }
+    let operation: CESEngineOperation?
+    switch tag {
+    case requestQueueTag:
+      guard serial == 0 else { return nil }
+      operation = nil
+    case sendTag:
+      guard serial != 0 else { return nil }
+      operation = .send
+    case receiveTag:
+      guard serial != 0 else { return nil }
+      operation = .receive
+    default:
+      return nil
+    }
+    return (index: UInt32(index), generation: UInt32(generation), operation: operation)
+  }
+}
+
 // Transport records: fixed addresses Windows may borrow. Business state belongs
 // exclusively to the pure engine. Provider ownership is retired before Events.
 @unsafe
 package struct CESEngineRequest {
-  package var connectionIndex: UInt32 = 0
-  package var operation: CESEngineOperation = .receive
-  /// The generation that posted this context. The record address is stable for the slot's lifetime,
-  /// so the tag travels with it and a completion can be told apart from one of an earlier one.
-  package var generation: UInt32 = 0
+  /// Value RIO hands back for the posted operation; zero while the slot owns none.
+  package var token: UInt64 = 0
+  /// Submission serial of this slot; never reset across generations, so a token is not reused.
+  package var serial: UInt32 = 0
   package init() {}
 }
 @unsafe
@@ -556,7 +636,6 @@ package struct CESEngineWorker: ~Copyable {
   package var requestAddress: UnsafeMutablePointer<CESEngineRequest>?
   package var notificationAddress: UnsafeMutablePointer<OVERLAPPED>?
   package var resultsAddress: UnsafeMutablePointer<RIORESULT>?
-  package var requestRange: Range<UInt> = 0..<0
   package var acceptorAddress: UnsafeMutablePointer<CESEngineAcceptor>?
   package var providerOutstanding: UInt32 = 0
   package var notificationArmed = false
@@ -578,8 +657,15 @@ package struct CESEngineWorker: ~Copyable {
       cesFailFast(stage: "server worker release before join", error: 5023)
     }
     if let connections = unsafe connectionAddress {
+      let lanes = unsafe requestAddress
       for i in unsafe 0..<Int(configurationStorage.slotCount) {
-        if unsafe connections[i].providerOperation != nil {
+        // The lane array is optional here: a release that runs before it exists must still refuse a
+        // slot that owns a provider operation, which is the guard this boundary exists for.
+        var posted = unsafe connections[i].providerOperation != nil
+        if let lanes = unsafe lanes {
+          posted = unsafe posted || lanes[i].token != 0
+        }
+        if posted {
           cesFailFast(stage: "worker RIO cleanup with outstanding operations", error: 996)
         }
       }
@@ -604,7 +690,8 @@ package func cesWorkerReleaseSlot(_ w: UnsafeMutablePointer<CESEngineWorker>, in
     let base = unsafe w.pointee.connectionAddress
   else { cesFailFast(stage: "TCP connection release index", error: 13) }
   let c = unsafe base.advanced(by: Int(index))
-  guard unsafe c.pointee.providerOperation == nil else {
+  let lane = unsafe w.pointee.requestAddress!.advanced(by: Int(index))
+  guard unsafe c.pointee.providerOperation == nil, unsafe lane.pointee.token == 0 else {
     cesFailFast(stage: "TCP connection release precondition", error: 996)
   }
   unsafe cesWorkerCloseSlot(w, index: index)
@@ -618,7 +705,10 @@ private func cesWorkerPost(
     cesFailFast(stage: "worker post index", error: 13)
   }
   let c = unsafe w.pointee.connectionAddress!.advanced(by: Int(index))
-  guard unsafe c.pointee.providerOperation == nil, let rq = unsafe c.pointee.requestQueue else {
+  let lane = unsafe w.pointee.requestAddress!.advanced(by: Int(index))
+  guard unsafe c.pointee.providerOperation == nil, unsafe lane.pointee.token == 0,
+    let rq = unsafe c.pointee.requestQueue
+  else {
     cesFailFast(stage: "worker post ownership", error: 13)
   }
   let stride = unsafe w.pointee.configuration.options.rioBufferBytes
@@ -627,9 +717,13 @@ private func cesWorkerPost(
   guard unsafe w.pointee.arena != nil else { cesFailFast(stage: "worker missing arena", error: 13) }
   unsafe c.pointee.buffer = unsafe w.pointee.arena!.view(
     index: index, offset: offset, length: length)
-  let request = unsafe w.pointee.requestAddress!.advanced(by: Int(index))
-  unsafe request.pointee.operation = operation
-  unsafe request.pointee.generation = unsafe c.pointee.generation
+  let serial = CESRequestContext.nextSerial(unsafe lane.pointee.serial)
+  guard
+    let context = CESRequestContext.encode(
+      index: index, generation: unsafe c.pointee.generation, serial: serial,
+      tag: operation == .receive ? CESRequestContext.receiveTag : CESRequestContext.sendTag)
+  else { cesFailFast(stage: "worker post context", error: 13) }
+  let request = unsafe UnsafeMutableRawPointer(bitPattern: UInt(context))
   let bufferOffset = unsafe MemoryLayout<CESEngineConnection>.offset(
     of: \CESEngineConnection.buffer)!
   let buffer = unsafe UnsafeMutableRawPointer(c).advanced(by: bufferOffset).assumingMemoryBound(
@@ -640,6 +734,8 @@ private func cesWorkerPost(
     ? unsafe rio.RIOReceive!(rq, buffer, 1, 0, request).boolValue
     : unsafe rio.RIOSend!(rq, buffer, 1, 0, request).boolValue
   if !succeeded { return cesWinsockFailure(operation == .receive ? "RIOReceive" : "RIOSend") }
+  unsafe lane.pointee.serial = serial
+  unsafe lane.pointee.token = context
   unsafe c.pointee.providerOperation = operation
   unsafe c.pointee.postedLength = length
   unsafe w.pointee.providerOutstanding += 1
@@ -689,25 +785,34 @@ private func cesWorkerArm(_ w: UnsafeMutablePointer<CESEngineWorker>) {
 package func cesWorkerNormalizeCompletion(
   _ w: UnsafeMutablePointer<CESEngineWorker>, result: RIORESULT
 ) -> CESCompletion {
-  guard let requests = unsafe w.pointee.requestAddress,
-    let connections = unsafe w.pointee.connectionAddress
+  let slotCount = unsafe w.pointee.configuration.slotCount
+  guard let decoded = CESRequestContext.decode(UInt64(result.RequestContext)),
+    let connections = unsafe w.pointee.connectionAddress,
+    let requests = unsafe w.pointee.requestAddress,
+    decoded.index < slotCount
   else { cesFailFast(stage: "server RIO RequestContext range", error: 13) }
-  let address = UInt(result.RequestContext)
-  let first = UInt(bitPattern: requests)
-  let stride = unsafe UInt(MemoryLayout<CESEngineRequest>.stride)
-  guard unsafe w.pointee.requestRange.contains(address), stride != 0,
-    (address - first) % stride == 0
-  else { cesFailFast(stage: "server RIO RequestContext range", error: 13) }
-  let index = UInt32((address - first) / stride)
+  let index = decoded.index
   let c = unsafe connections.advanced(by: Int(index))
-  let request = unsafe requests.advanced(by: Int(index))
-  guard unsafe c.pointee.owner == w, unsafe c.pointee.index == index,
-    unsafe request.pointee.connectionIndex == index
-  else { cesFailFast(stage: "server RIO request metadata", error: 13) }
+  let lane = unsafe requests.advanced(by: Int(index))
+  guard unsafe c.pointee.owner == w, unsafe c.pointee.index == index else {
+    cesFailFast(stage: "server RIO request metadata", error: 13)
+  }
+  // The queue identity is bound to the generation that created it, so a completion whose queue
+  // belongs to an earlier generation is rejected here, before the posted token is compared.
+  guard
+    let queueIdentity = CESRequestContext.encode(
+      index: index, generation: unsafe c.pointee.generation, serial: 0,
+      tag: CESRequestContext.requestQueueTag),
+    UInt64(result.SocketContext) == queueIdentity
+  else { cesFailFast(stage: "worker RIO SocketContext identity", error: 13) }
+  guard unsafe lane.pointee.token == UInt64(result.RequestContext) else {
+    cesFailFast(stage: "worker completion identity", error: 13)
+  }
+  let liveGeneration = unsafe c.pointee.generation
   guard let operation = unsafe c.pointee.providerOperation,
-    unsafe operation == request.pointee.operation, unsafe w.pointee.providerOutstanding != 0
+    operation == decoded.operation, unsafe w.pointee.providerOutstanding != 0
   else { cesFailFast(stage: "worker completion without provider ownership", error: 13) }
-  guard unsafe request.pointee.generation == c.pointee.generation else {
+  guard decoded.generation == liveGeneration else {
     cesFailFast(stage: "worker completion generation", error: 13)
   }
   guard unsafe result.BytesTransferred <= c.pointee.postedLength else {
@@ -738,6 +843,8 @@ private func cesWorkerDrain(
       let value = unsafe cesWorkerNormalizeCompletion(w, result: result)
       let index = value.index
       let c = unsafe w.pointee.connectionAddress!.advanced(by: Int(index))
+      let lane = unsafe w.pointee.requestAddress!.advanced(by: Int(index))
+      unsafe lane.pointee.token = 0
       unsafe c.pointee.providerOperation = nil
       unsafe c.pointee.postedLength = 0
       unsafe w.pointee.providerOutstanding -= 1
@@ -785,10 +892,20 @@ private func cesWorkerTakeSocket(
     cesFailFast(stage: "admission credit/free pool mismatch", error: 5023)
   }
   let c = unsafe w.pointee.connectionAddress!.advanced(by: Int(index))
+  let lane = unsafe w.pointee.requestAddress!.advanced(by: Int(index))
+  guard unsafe c.pointee.providerOperation == nil, unsafe lane.pointee.token == 0 else {
+    cesFailFast(stage: "TCP slot reuse precondition", error: 996)
+  }
+  // The generation is chosen before the queue exists, so the queue identity and the first post of
+  // the new generation both name the generation this slot is about to admit.
+  let generation = CESRequestContext.nextGeneration(unsafe c.pointee.generation)
   let rio = unsafe w.pointee.configuration.rio
   guard
+    let queueIdentity = CESRequestContext.encode(
+      index: index, generation: generation, serial: 0, tag: CESRequestContext.requestQueueTag),
     let rq = unsafe rio.RIOCreateRequestQueue!(
-      raw, 1, 1, 1, 1, w.pointee.completionQueue.rawValue, w.pointee.completionQueue.rawValue, c)
+      raw, 1, 1, 1, 1, w.pointee.completionQueue.rawValue, w.pointee.completionQueue.rawValue,
+      UnsafeMutableRawPointer(bitPattern: UInt(queueIdentity)))
   else {
     let error = WSAGetLastError()
     cesReport(stage: "RIOCreateRequestQueue(TCP)", error: error)
@@ -802,10 +919,9 @@ private func cesWorkerTakeSocket(
   unsafe c.pointee.socket = owner.release()
   unsafe c.pointee.requestQueue = rq
   // This is the slot's only reuse point, so it is where the generation changes - before admit posts
-  // the first receive of the new generation. The tag is an identity rather than an ownership ledger,
-  // so it wraps to one at the limit.
-  let currentGeneration = unsafe c.pointee.generation
-  unsafe c.pointee.generation = currentGeneration == UInt32.max ? 1 : currentGeneration + 1
+  // the first receive of the new generation. Every submission carries the generation it was posted
+  // under, so a completion of the previous generation can still be told apart afterwards.
+  unsafe c.pointee.generation = generation
   let action = unsafe w.pointee.engine.admit(index: index, now: GetTickCount64())
   unsafe cesWorkerExecute(w, action)
   unsafe cesAckAccept(operation)
@@ -941,16 +1057,9 @@ package func cesInitializeWorker(_ w: UnsafeMutablePointer<CESEngineWorker>) -> 
       stride: w.pointee.configuration.options.rioBufferBytes,
       memoryLimit: w.pointee.configuration.memoryShare)
   } catch { return error }
-  let first = unsafe UInt(bitPattern: w.pointee.requestAddress!)
-  let (extent, overflow) = unsafe UInt(MemoryLayout<CESEngineRequest>.stride)
-    .multipliedReportingOverflow(by: UInt(count))
-  let (end, endOverflow) = first.addingReportingOverflow(extent)
-  guard !overflow && !endOverflow else { return .invariant("server request allocation extent") }
-  unsafe w.pointee.requestRange = first..<end
   for i in 0..<count {
     unsafe w.pointee.connectionAddress![i].owner = w
     unsafe w.pointee.connectionAddress![i].index = UInt32(i)
-    unsafe w.pointee.requestAddress![i].connectionIndex = UInt32(i)
   }
   var notificationDescription = unsafe RIO_NOTIFICATION_COMPLETION()
   unsafe notificationDescription.Type = RIO_IOCP_COMPLETION
@@ -1005,8 +1114,15 @@ package func cesRequireWorkerRelease(_ w: UnsafeMutablePointer<CESEngineWorker>)
     businessOutstanding: unsafe w.pointee.engine.outstanding,
     stage: "worker RIO cleanup with outstanding operations")
   if let connections = unsafe w.pointee.connectionAddress {
+    let lanes = unsafe w.pointee.requestAddress
     for i in unsafe 0..<Int(w.pointee.configuration.slotCount) {
-      if unsafe connections[i].providerOperation != nil {
+      // The lane array is optional here: a release that runs before it exists must still refuse a
+      // slot that owns a provider operation, which is the guard this boundary exists for.
+      var posted = unsafe connections[i].providerOperation != nil
+      if let lanes = unsafe lanes {
+        posted = unsafe posted || lanes[i].token != 0
+      }
+      if posted {
         cesFailFast(stage: "worker RIO cleanup with outstanding operations", error: 996)
       }
     }
